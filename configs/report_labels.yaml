@@ -1,0 +1,35 @@
+# 单篇研报未来验证 Label 配置。
+# 服务器路径未知时保持为空；运行前通过环境变量或直接编辑本文件填写。
+
+paths:
+  reports: ${REPORT_LABEL_REPORTS_PATH:-}
+  trading_calendar: ${REPORT_LABEL_CALENDAR_PATH:-}
+  actuals: ${REPORT_LABEL_ACTUALS_PATH:-}
+  # actual_schema 的 columns 采用 canonical_field: source_field 映射；源字段已
+  # 与标准字段一致时可留空，具体模板见 report_actual_schema.example.yaml。
+  actual_schema: ${REPORT_LABEL_ACTUAL_SCHEMA_PATH:-}
+
+calendar:
+  date_column: date
+
+coverage:
+  # 可显式覆盖数据文件的真实覆盖边界；为空时依次读取 manifest、解析文件名。
+  start_date: null
+  end_date: null
+
+build:
+  # Label 样本区间；为空时使用数据覆盖边界。
+  start_date: null
+  end_date: null
+  forecast_horizons: [0, 1, 2]
+  confirmation_months: [1, 3]
+  lookback_days: 180
+  scale_history_months: 12
+  min_scale_samples: 500
+  min_peer_orgs: 4
+  min_active_orgs: 3
+  min_probe_updates: 2
+  forecast_np_unit_multiplier: 10000.0
+
+output:
+  directory: artifacts/report_labels

@@ -1,11 +1,6 @@
 import pandas as pd
-import pytest
-
 from src.trading_calendar import (
     align_to_trading_day,
-    shift_to_trading_month_end,
-    trading_month_end_map,
-    trading_month_ends,
 )
 
 
@@ -68,26 +63,6 @@ def test_align_to_trading_day_converts_aware_timestamps_to_shanghai_time():
 
     assert actual.index.tolist() == [10, 20]
     assert actual.tolist() == [pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-08")]
-
-
-def test_monthly_dates_are_last_trading_days_not_calendar_month_ends():
-    actual = trading_month_ends(CALENDAR, "2024-01", "2024-03")
-    assert actual.tolist() == [
-        pd.Timestamp("2024-01-31"),
-        pd.Timestamp("2024-02-29"),
-        pd.Timestamp("2024-03-29"),
-    ]
-
-    mapping = trading_month_end_map(CALENDAR, "2024-01", "2024-03")
-    assert shift_to_trading_month_end(pd.Timestamp("2024-01-31"), 2, mapping) == pd.Timestamp(
-        "2024-03-29"
-    )
-    assert pd.isna(shift_to_trading_month_end(pd.Timestamp("2024-03-29"), 1, mapping))
-
-
-def test_monthly_dates_fail_if_calendar_has_a_gap():
-    with pytest.raises(ValueError, match="2024-02"):
-        trading_month_ends(["2024-01-31", "2024-03-29"], "2024-01", "2024-03")
 
 
 def test_staleness_is_natural_days_not_number_of_sessions():

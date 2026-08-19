@@ -1,0 +1,21 @@
+# Actual 源字段适配模板。冒号左侧为固定 canonical 字段，右侧改为服务器源字段名。
+columns:
+  stock_code: stock_code
+  fy: fy
+  actual_np: actual_np
+  actual_publish_date: actual_publish_date
+  actual_known_date: actual_known_date
+  unit_multiplier: unit_multiplier
+  currency: currency
+  source_id: source_id
+  actual_version: actual_version
+
+# 源文件缺少这些整列时使用的默认值。若净利润单位为万元，将 multiplier 改为 10000。
+defaults:
+  unit_multiplier: 1.0
+  currency: CNY
+  actual_version: annual_report_first
+
+# 只保留首次正式年报版本；源数据编码不同时修改右侧值。
+filters:
+  actual_version: [annual_report_first]

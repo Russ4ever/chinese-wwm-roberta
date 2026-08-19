@@ -2,6 +2,7 @@
 
 本模块只消费项目已有的交易日数据，不负责下载或更新交易日历。
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -46,7 +47,7 @@ def load_trading_dates(path: str | Path, date_column: str = "date") -> pd.Dateti
     source = Path(path).expanduser()
     if not source.is_file():
         raise FileNotFoundError(
-            f"交易日历文件不存在: {source}；请通过 LABEL_TRADING_CALENDAR 指向项目原有文件"
+            f"交易日历文件不存在: {source}；请让配置指向服务器已有的 CSV/Parquet 文件"
         )
 
     suffix = source.suffix.lower()
@@ -55,7 +56,9 @@ def load_trading_dates(path: str | Path, date_column: str = "date") -> pd.Dateti
     elif suffix in {".csv", ".txt"}:
         frame = pd.read_csv(source, usecols=[date_column])
     else:
-        raise ValueError(f"不支持的交易日历格式 {suffix!r}，仅支持 CSV/Parquet: {source}")
+        raise ValueError(
+            f"不支持的交易日历格式 {suffix!r}，仅支持 CSV/Parquet: {source}"
+        )
 
     if date_column not in frame.columns:
         raise ValueError(f"交易日历缺少日期列 {date_column!r}: {source}")
@@ -103,45 +106,3 @@ def align_to_trading_day(
         target_index = publish_dates.loc[needs_next].index[in_range]
         result.loc[target_index] = calendar_values[positions[in_range]]
     return result
-
-
-def trading_month_ends(
-    trading_dates: pd.DatetimeIndex | Iterable[object],
-    start: str | pd.Timestamp | pd.Period,
-    end: str | pd.Timestamp | pd.Period,
-) -> pd.DatetimeIndex:
-    """返回区间内每个月最后一个交易日；任何月份缺失都会报错。"""
-    calendar = normalize_trading_dates(trading_dates)
-    start_period = pd.Period(start, freq="M")
-    end_period = pd.Period(end, freq="M")
-    if end_period < start_period:
-        raise ValueError(f"月份区间倒置: {start_period} > {end_period}")
-
-    periods = pd.period_range(start_period, end_period, freq="M")
-    grouped = pd.Series(calendar, index=calendar.to_period("M")).groupby(level=0).max()
-    missing = periods.difference(grouped.index)
-    if len(missing):
-        raise ValueError("交易日历缺少月份: " + ", ".join(map(str, missing)))
-    return pd.DatetimeIndex(grouped.loc[periods].to_numpy())
-
-
-def trading_month_end_map(
-    trading_dates: pd.DatetimeIndex | Iterable[object],
-    start: str | pd.Timestamp | pd.Period,
-    end: str | pd.Timestamp | pd.Period,
-) -> dict[pd.Period, pd.Timestamp]:
-    """生成 ``月度 Period -> 当月最后交易日`` 映射。"""
-    ends = trading_month_ends(trading_dates, start, end)
-    return {date.to_period("M"): date for date in ends}
-
-
-def shift_to_trading_month_end(
-    date: object,
-    months: int,
-    month_ends: dict[pd.Period, pd.Timestamp],
-) -> pd.Timestamp:
-    """将日期平移若干月并返回目标月最后交易日，覆盖不足时返回 ``NaT``。"""
-    if pd.isna(date):
-        return pd.NaT
-    target = pd.Timestamp(date).to_period("M") + months
-    return month_ends.get(target, pd.NaT)

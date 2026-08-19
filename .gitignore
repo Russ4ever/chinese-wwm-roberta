@@ -33,3 +33,8 @@ label_engineering/*.csv
 label_engineering/*.parquet
 label_engineering/v2/*.csv
 label_engineering/v2/*.parquet
+
+# 本地 agent 工作辅助与环境配置文档（含内网 IP/代理/token 等敏感信息，仅本地保留，不提交 GitHub）
+README.md
+docs/环境配置.md
+scripts/git_env.sh

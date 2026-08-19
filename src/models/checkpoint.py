@@ -1,12 +1,10 @@
-"""checkpoint 安全解包、前缀处理与键报告（P0 资产清点与可信加载）。
+"""checkpoint 安全解包、前缀处理与键报告。
 
-无数据阶段的核心目标之一是"可复现、可审计"的加载流程。本模块只包含纯函数与
-安全的加载/比较工具，不依赖 notebook 隐藏状态，普通 Python 脚本可直接导入。
+本模块只包含纯函数与安全的加载/比较工具，不依赖 notebook 隐藏状态。
 
 设计要点
 --------
-- ``unwrap_state_dict`` / ``strip_prefix`` 均为纯函数，返回新对象，不修改入参
-  （修复 ``compare_layers.py`` 中 ``for d in (base, ft): d = d[...]`` 的原地失效写法）。
+- ``unwrap_state_dict`` / ``strip_prefix`` 均为纯函数，返回新对象，不修改入参。
 - ``load_state_dict_safe`` 优先 ``weights_only=True`` 反序列化，避免任意 pickle 执行。
 - ``match_state_dicts`` 输出 matched / missing / unexpected / shape_mismatch，
   并给出 tensor 覆盖率与参数覆盖率，便于验收。
@@ -14,8 +12,9 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
 
@@ -30,10 +29,21 @@ def load_state_dict_safe(path: str, map_location: str = "cpu") -> Dict[str, torc
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"checkpoint 文件不存在: {path}")
-    try:
-        return torch.load(path, map_location=map_location, weights_only=True)
-    except TypeError:  # 旧版 torch 无 weights_only 参数
-        return torch.load(path, map_location=map_location)
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        obj = torch.load(path, map_location=map_location, weights_only=True)
+    else:  # pragma: no cover - 仅兼容不支持 weights_only 的旧版 PyTorch
+        obj = torch.load(path, map_location=map_location)
+
+    state = unwrap_state_dict(obj)
+    if not isinstance(state, Mapping):
+        raise TypeError(f"checkpoint 解包后不是 state dict: {type(state).__name__}")
+    invalid = [
+        key for key, value in state.items()
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor)
+    ]
+    if invalid:
+        raise TypeError(f"checkpoint 含非张量 state 项: {invalid[:5]}")
+    return dict(state)
 
 
 # --------------------------------------------------------------------------- #
@@ -59,12 +69,24 @@ def strip_prefix(
 
     返回**新 dict**，不修改入参。只删除出现在键首的前缀；剩余键按原顺序保留。
     """
+    if any(not prefix for prefix in prefixes):
+        raise ValueError("prefixes 不得包含空字符串")
+
     out: Dict[str, torch.Tensor] = {}
-    for key, value in state_dict.items():
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                key = key[len(prefix):]
-                break
+    for original_key, value in state_dict.items():
+        key = original_key
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    changed = True
+                    break
+        if key in out:
+            raise ValueError(
+                f"移除前缀后键冲突: {original_key!r} 与其他键都映射到 {key!r}"
+            )
         out[key] = value
     return out
 
@@ -146,10 +168,18 @@ def report_fc(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, object]:
             out[key] = {
                 "present": True,
                 "shape": list(t.shape),
+                "expected_shape": list(expected),
+                "shape_matches": tuple(t.shape) == expected,
                 "numel": t.numel(),
             }
         else:
-            out[key] = {"present": False, "shape": None, "numel": 0}
+            out[key] = {
+                "present": False,
+                "shape": None,
+                "expected_shape": list(expected),
+                "shape_matches": False,
+                "numel": 0,
+            }
     return out
 
 
@@ -158,6 +188,8 @@ def report_fc(state_dict: Mapping[str, torch.Tensor]) -> Dict[str, object]:
 # --------------------------------------------------------------------------- #
 def sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
     """流式计算文件 SHA-256，适用于 >400MB 的权重文件。"""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size 必须大于 0")
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while chunk := f.read(chunk_size):
@@ -186,7 +218,7 @@ def state_dict_diff_metrics(
     b: Mapping[str, torch.Tensor],
     keys: Optional[Iterable[str]] = None,
 ) -> Dict[str, float]:
-    """对给定键集合计算 base/delta/relative L2 与 cosine（用于自比较与 P6）。
+    """对给定键集合计算 base/delta/relative L2 与 cosine。
 
     相同 state dict 自比较时应得到：所有 delta=0，cos=1。
 
@@ -202,31 +234,39 @@ def state_dict_diff_metrics(
     max_abs_delta = 0.0
     cosine_sum = 0.0
     counted = 0
-    missing: List[str] = []
     for k in key_list:
         if k not in a or k not in b:
-            missing.append(k)
-            continue
+            raise KeyError(f"比较键 {k!r} 未同时出现在两组 state dict 中")
+        if tuple(a[k].shape) != tuple(b[k].shape):
+            raise ValueError(
+                f"比较键 {k!r} shape 不一致: {tuple(a[k].shape)} != {tuple(b[k].shape)}"
+            )
         ta = a[k].flatten().double()
         tb = b[k].flatten().double()
+        if ta.numel() == 0:
+            continue
         delta = ta - tb
         total_delta_l2 += (delta * delta).sum().item()
         total_base_l2 += (tb * tb).sum().item()
         total_abs_delta += delta.abs().sum().item()
         total_numel += tb.numel()
         max_abs_delta = max(max_abs_delta, delta.abs().max().item())
-        denom = tb.norm().item() * ta.norm().item()
-        cosine_sum += float((ta @ tb).item() / denom) if denom > 0 else 1.0
+        norm_a = ta.norm().item()
+        norm_b = tb.norm().item()
+        denom = norm_a * norm_b
+        if denom > 0:
+            cosine_sum += float((ta @ tb).item() / denom)
+        else:
+            cosine_sum += 1.0 if norm_a == 0 and norm_b == 0 else 0.0
         counted += 1
     if counted == 0:
         raise ValueError(
-            f"state_dict_diff_metrics 没有比较任何键（请求 {len(key_list)} 个，"
-            f"全部缺失: {missing[:5]}...）；空比较不应返回'完美一致'")
+            f"state_dict_diff_metrics 没有比较任何非空张量（请求 {len(key_list)} 个）")
     return {
         "delta_l2": total_delta_l2 ** 0.5,
         "base_l2": total_base_l2 ** 0.5,
         "relative_l2": (total_delta_l2 ** 0.5) / (total_base_l2 ** 0.5) if total_base_l2 else float("nan"),
         "mae": total_abs_delta / total_numel if total_numel else float("nan"),
         "max_abs_delta": max_abs_delta,
-        "mean_cosine": cosine_sum / counted if counted else 1.0,
+        "mean_cosine": cosine_sum / counted,
     }

@@ -1,4 +1,4 @@
-"""完整二分类推理候选模型（P1）。
+"""完整二分类推理候选模型。
 
 由于原模型类和训练代码暂缺，本模块实现的是"可枚举、可替换、明确标注为候选"
 的前向，而不是武断认定某种 pooling。标签映射未知时，输出字段固定为
@@ -9,21 +9,24 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers import BertModel
 
-from .checkpoint import load_state_dict_safe
+from .checkpoint import load_state_dict_safe, sha256_file, strip_prefix
 from .pooling import apply_pooling
 
-P2_IN = 768
-P2_OUT = 2
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+
+if TYPE_CHECKING:
+    from transformers import BertModel
+
+NUM_CLASSES = 2
 
 
 def checkpoint_hash(path: str, manifest_path: Optional[str] = None) -> str:
@@ -44,17 +47,16 @@ def checkpoint_hash(path: str, manifest_path: Optional[str] = None) -> str:
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            h = meta.get("checkpoint", {}).get("sha256")
-            size = meta.get("checkpoint", {}).get("size_bytes")
-            if h and size == os.path.getsize(path):
-                # 文件大小一致且 manifest 未改动（用 mtime 做二次校验）
-                manifest_mtime = os.path.getmtime(manifest_path)
-                file_mtime = os.path.getmtime(path)
-                if manifest_mtime >= file_mtime:
-                    return h
-        except Exception:  # noqa: BLE001
+            checkpoint_meta = meta.get("checkpoint", {})
+            stat = os.stat(path)
+            h = checkpoint_meta.get("sha256")
+            size = checkpoint_meta.get("size_bytes")
+            mtime_ns = checkpoint_meta.get("mtime_ns")
+            if h and size == stat.st_size and mtime_ns == stat.st_mtime_ns:
+                return str(h)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
-    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    return sha256_file(path)
 
 
 @dataclass
@@ -66,7 +68,7 @@ class CandidateOutput:
 
     logits: torch.Tensor               # [batch, 2]
     probabilities: torch.Tensor        # [batch, 2]
-    pooled_feature: torch.Tensor       # [batch, 768]
+    pooled_feature: torch.Tensor       # [batch, hidden]
     pooling: str
     pooling_confirmed: bool
     model_hash: str
@@ -102,12 +104,12 @@ class BinaryClassificationCandidate(nn.Module):
 
     参数来源：
     - backbone：checkpoint 中 ``bert.*`` 键，去掉前缀后 strict 加载进 ``BertModel``；
-    - ``fc``：checkpoint 中的 ``fc.weight [2,768]`` 与 ``fc.bias [2]``。
+    - ``fc``：checkpoint 中的 ``fc.weight [2,hidden]`` 与 ``fc.bias [2]``。
     """
 
     def __init__(
         self,
-        bert: BertModel,
+        bert: "BertModel",
         fc: nn.Linear,
         pooling: str,
         pooling_confirmed: bool = False,
@@ -156,9 +158,14 @@ class BinaryClassificationCandidate(nn.Module):
         )
 
 
-def load_backbone(base_model_dir: str) -> BertModel:
-    """从本地底座目录构造 BertModel（local_files_only，eager attention）。"""
-    return BertModel.from_pretrained(base_model_dir, local_files_only=True, attn_implementation="eager")
+def load_backbone(base_model_dir: str) -> "BertModel":
+    """从本地配置构造 BertModel；权重随后由项目 checkpoint 严格加载。"""
+    from transformers import BertConfig, BertModel
+
+    config = BertConfig.from_pretrained(base_model_dir, local_files_only=True)
+    config._attn_implementation = "eager"  # transformers 的公开参数暂无构造器入口
+    config.return_dict = True
+    return BertModel(config)
 
 
 def build_candidate(
@@ -172,20 +179,31 @@ def build_candidate(
 ) -> BinaryClassificationCandidate:
     """构建完整二分类推理候选。
 
-    - backbone 以 strict=True 从 ckpt 的 ``bert.*`` 键加载（P0 已证明 100% 覆盖）；
+    - backbone 以 strict=True 从 ckpt 的 ``bert.*`` 键加载；
     - fc 从 ckpt 的 ``fc.weight/fc.bias`` 加载。
     """
     bert = load_backbone(base_model_dir)
-    state = load_state_dict_safe(checkpoint_path, map_location="cpu")
+    state = strip_prefix(load_state_dict_safe(checkpoint_path, map_location="cpu"))
     backbone = {k[len("bert."):]: v for k, v in state.items() if k.startswith("bert.")}
+    if not backbone:
+        raise KeyError("checkpoint 中没有 bert.* backbone 权重")
     bert.load_state_dict(backbone, strict=True)
 
     if "fc.weight" not in state or "fc.bias" not in state:
         raise KeyError("checkpoint 缺少 fc.weight / fc.bias，无法构建二分类候选")
-    fc = nn.Linear(P2_IN, P2_OUT)
+    weight = state["fc.weight"]
+    bias = state["fc.bias"]
+    expected_weight_shape = (NUM_CLASSES, bert.config.hidden_size)
+    if tuple(weight.shape) != expected_weight_shape or tuple(bias.shape) != (NUM_CLASSES,):
+        raise ValueError(
+            "checkpoint 分类头 shape 不匹配: "
+            f"fc.weight={tuple(weight.shape)}（期望 {expected_weight_shape}）, "
+            f"fc.bias={tuple(bias.shape)}（期望 {(NUM_CLASSES,)}）"
+        )
+    fc = nn.Linear(bert.config.hidden_size, NUM_CLASSES)
     with torch.no_grad():
-        fc.weight.copy_(state["fc.weight"].to(dtype))
-        fc.bias.copy_(state["fc.bias"].to(dtype))
+        fc.weight.copy_(weight)
+        fc.bias.copy_(bias)
 
     if model_hash is None:
         model_hash = checkpoint_hash(checkpoint_path)
@@ -194,32 +212,3 @@ def build_candidate(
         bert, fc, pooling=pooling, pooling_confirmed=pooling_confirmed, model_hash=model_hash,
     )
     return model.to(device=device, dtype=dtype).eval()
-
-
-def tokenize_texts(
-    texts: List[str],
-    tokenizer,
-    max_length: int = 128,
-    truncation: bool = True,
-    padding: bool = True,
-    return_tensors: str = "pt",
-) -> Dict[str, torch.Tensor]:
-    """组批 tokenize，返回可直接喂给候选模型的 dict。"""
-    return tokenizer(
-        texts,
-        max_length=max_length,
-        truncation=truncation,
-        padding=padding,
-        return_tensors=return_tensors,
-    )
-
-
-def load_tokenizer(base_model_dir: str):
-    """加载本地 tokenizer。
-
-    注意：transformers 5.x 中本目录无 fast tokenizer，``BertTokenizerFast`` 会静默
-    回退为 slow ``BertTokenizer``，行为等价，这里显式使用 slow 类。
-    """
-    from transformers import BertTokenizer
-
-    return BertTokenizer.from_pretrained(base_model_dir, local_files_only=True)

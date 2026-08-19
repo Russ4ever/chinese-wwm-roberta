@@ -12,30 +12,42 @@
     按 (date,stock) 取多数评级（众数，平票取更高档），0 视为无信号剔除，
     同样计算 rank_ic，并额外输出评级分组收益 + 多空价差。
 
-运行环境：/home/intern_fjq_2026/miniconda3/envs/intern_fjq/bin/python
-运行命令：
-    cd /home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/label_engineering
-    /home/intern_fjq_2026/miniconda3/envs/intern_fjq/bin/python eval_forecast_factor.py
+路径均可通过环境变量覆盖，默认从仓库 data 目录读取、写入 artifacts。
 """
 
 import json
 import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.trading_calendar import (  # noqa: E402
+    align_to_trading_day,
+    normalize_trading_dates,
+    parse_market_timestamps,
+)
+
 # ----------------------------------------------------------------------------
 # 配置
 # ----------------------------------------------------------------------------
-DATA = "/home/intern_fjq_2026/data"
-BARRA = "/home/intern_fjq_2026/barra"
-OUT = "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/label_engineering"
+DATA = os.environ.get("FORECAST_FACTOR_DATA_ROOT", str(ROOT / "data"))
+BARRA = os.environ.get("FORECAST_FACTOR_BARRA_ROOT", str(ROOT / "data" / "barra"))
+OUT = os.environ.get("FORECAST_FACTOR_OUTPUT_DIR", str(ROOT / "artifacts" / "label_engineering"))
 
-JSONL = os.path.join(DATA, "NLP/research_report/forecast_stk_20240101_20241231.jsonl")
-RTN_DIR = os.path.join(DATA, "RTN_daily")
-IND_H5 = os.path.join(BARRA, "Barra_Industry.h5")
-SIZE_H5 = os.path.join(BARRA, "Barra_SIZE.h5")
+JSONL = os.environ.get(
+    "FORECAST_FACTOR_SOURCE",
+    os.path.join(DATA, "research_report", "forecast_stk_20240101_20241231.jsonl"),
+)
+RTN_DIR = os.environ.get("FORECAST_FACTOR_RTN_DIR", os.path.join(DATA, "RTN_daily"))
+IND_H5 = os.environ.get("FORECAST_FACTOR_INDUSTRY", os.path.join(BARRA, "Barra_Industry.h5"))
+SIZE_H5 = os.environ.get("FORECAST_FACTOR_SIZE", os.path.join(BARRA, "Barra_SIZE.h5"))
 
 RTNS = ["rtn_1d", "rtn_5d", "rtn_10d", "rtn_20d"]
 FACTORS = ["FORECAST_ROE", "FORECAST_OR", "FORECAST_NP", "FORECAST_EPS"]
@@ -47,11 +59,11 @@ FACTOR_OUT = {
 }
 
 # year_mode: all | fy0 | fy1 | fy2
-#   all = 不筛预测年份，按 (date,stock) 中位数聚合（分析师共识口径，默认）
+#   all = 不筛预测年份（仅用于敏感性检查；会混合不同财年的绝对值）
 #   fy0 = 只保留 REPORT_YEAR == CREATE_DATE 年份
 #   fy1 = 只保留 REPORT_YEAR == CREATE_DATE 年份 + 1（下一财年）
 #   fy2 = 只保留 REPORT_YEAR == CREATE_DATE 年份 + 2
-YEAR_MODE = "all"
+YEAR_MODE = os.environ.get("FORECAST_FACTOR_YEAR_MODE", "fy1").lower()
 
 MAD_N_SIGMA = 3.0       # 去极值：median ± 3 * 1.4826 * MAD
 MIN_NEUT_OBS = 50       # 当日截面样本少于该值不做中性化（该日记 NaN）
@@ -82,10 +94,12 @@ def read_jsonl(path, usecols):
                 continue
             try:
                 obj = json.loads(line)
-            except Exception:
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
                 continue
             rows.append({k: obj.get(k) for k in usecols})
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=usecols)
 
 
 def mad_winsor(x):
@@ -102,7 +116,6 @@ def mad_winsor(x):
 def neutralize_group(y, ind, size):
     """截面 OLS 残差：y ~ [1, 行业 one-hot, SIZE]，返回残差。
 
-    行业 dummy 与截距共线不影响最小二乘投影残差，直接用 lstsq 残差。
     成员数 < MIN_IND_MEMBERS 的行业并入 OTHER（-1）。
     """
     y = np.asarray(y, dtype=float)
@@ -115,7 +128,8 @@ def neutralize_group(y, ind, size):
     ind_work = np.array([-1 if c in small else c for c in ind])
 
     cols = [np.ones(n)]
-    for c in np.unique(ind_work):
+    # 截距存在时省略一个基准行业，避免完全共线和不稳定系数。
+    for c in np.unique(ind_work)[1:]:
         cols.append((ind_work == c).astype(float))
     cols.append(size)
     X = np.column_stack(cols)
@@ -139,7 +153,13 @@ def neutralize_factor(df, col):
     out = pd.Series(np.nan, index=df.index, dtype=float)
     for date, g in df.groupby("date"):
         sub = g[[col, "industry", "size"]]
-        valid = sub[col].notna() & sub["industry"].notna() & sub["size"].notna()
+        valid = (
+            sub[col].notna()
+            & sub["industry"].notna()
+            & sub["size"].notna()
+            & np.isfinite(sub[col].to_numpy(dtype=float))
+            & np.isfinite(sub["size"].to_numpy(dtype=float))
+        )
         idx = sub.index[valid]
         if valid.sum() < MIN_NEUT_OBS:
             continue
@@ -159,12 +179,12 @@ def summarize_ic(ics):
         return dict(ic_mean=np.nan, ic_std=np.nan, icir=np.nan,
                     t_stat=np.nan, ic_gt0_pct=np.nan, n_days=0)
     mean = float(np.mean(m))
-    std = float(np.std(m, ddof=1))
+    std = float(np.std(m, ddof=1)) if n > 1 else np.nan
     return dict(
         ic_mean=mean,
         ic_std=std,
-        icir=(mean / std) if std > 0 else np.nan,
-        t_stat=(mean / std * np.sqrt(n)) if std > 0 else np.nan,
+        icir=(mean / std) if np.isfinite(std) and std > 0 else np.nan,
+        t_stat=(mean / std * np.sqrt(n)) if np.isfinite(std) and std > 0 else np.nan,
         ic_gt0_pct=float((m > 0).mean()),
         n_days=n,
     )
@@ -179,6 +199,8 @@ def compute_ic_table(panel, eval_cols, rtn_cols):
                 sub = g[[col, r]].dropna()
                 n = len(sub)
                 if n < MIN_IC_OBS:
+                    ic = np.nan
+                elif sub[col].nunique() < 2 or sub[r].nunique() < 2:
                     ic = np.nan
                 else:
                     ic = spearmanr(sub[col], sub[r]).correlation
@@ -203,7 +225,7 @@ def compute_ic_table(panel, eval_cols, rtn_cols):
 def rating_consensus(s):
     """众数评级，平票取更高档；0(无)/空 剔除。"""
     s = s.dropna()
-    s = s[s != RATING_NONE]
+    s = s[s.isin(RATING_NAME)]
     if len(s) == 0:
         return np.nan
     vc = s.value_counts()
@@ -216,15 +238,20 @@ def rating_consensus(s):
 # ----------------------------------------------------------------------------
 def main():
     os.makedirs(OUT, exist_ok=True)
+    if YEAR_MODE not in {"all", "fy0", "fy1", "fy2"}:
+        raise ValueError(f"无效 YEAR_MODE: {YEAR_MODE!r}")
 
     # 1. 读研报预测 jsonl
     log("读取研报预测 jsonl ...")
     usecols = ["CREATE_DATE", "STOCK_CODE", "REPORT_YEAR"] + FACTORS + ["GG_RATING_CODE"]
     fc = read_jsonl(JSONL, usecols)
     log(f"  rows = {len(fc)}")
+    if fc.empty:
+        raise ValueError(f"研报输入为空或没有有效 JSON 行: {JSONL}")
 
-    fc["CREATE_DATE"] = pd.to_datetime(fc["CREATE_DATE"], errors="coerce")
-    fc["STOCK_CODE"] = fc["STOCK_CODE"].astype(str).str.zfill(6)
+    fc["CREATE_DATE"] = parse_market_timestamps(fc["CREATE_DATE"])
+    fc["STOCK_CODE"] = (fc["STOCK_CODE"].astype("string")
+                        .str.replace(r"\..*$", "", regex=True).str.zfill(6))
     fc["REPORT_YEAR"] = pd.to_numeric(fc["REPORT_YEAR"], errors="coerce")
     fc["GG_RATING_CODE"] = pd.to_numeric(fc["GG_RATING_CODE"], errors="coerce")
     for c in FACTORS:
@@ -237,6 +264,8 @@ def main():
         target_year = fc["CREATE_DATE"].dt.year + delta
         fc = fc[fc["REPORT_YEAR"] == target_year]
         log(f"  year_mode={YEAR_MODE} -> rows = {len(fc)}")
+        if fc.empty:
+            raise ValueError(f"year_mode={YEAR_MODE} 筛选后没有记录")
 
     # 3. 读 rtn 宽表，取股票列名集合 / 交易日序列
     log("读取 RTN 宽表 ...")
@@ -244,10 +273,18 @@ def main():
     trade_dates = None
     for f in RTNS:
         d = pd.read_parquet(os.path.join(RTN_DIR, f + ".parquet"), engine="pyarrow")
+        if "date" not in d.columns:
+            raise ValueError(f"{f}.parquet 缺少 date 列")
+        d["date"] = pd.to_datetime(d["date"], errors="coerce", format="mixed").dt.normalize()
+        d = d[d["date"].notna()].sort_values("date")
+        if d["date"].duplicated().any():
+            raise ValueError(f"{f}.parquet 含重复交易日")
         if trade_dates is None:
-            trade_dates = pd.to_datetime(d["date"]).sort_values().values
+            trade_dates = normalize_trading_dates(d["date"])
         rtn_frames[f] = d.set_index("date")
-    stock_cols = [c for c in rtn_frames[RTNS[0]].columns if c != "date"]
+    if trade_dates is None:
+        raise ValueError(f"收益目录中没有可用数据: {RTN_DIR}")
+    stock_cols = list(rtn_frames[RTNS[0]].columns)
 
     # 4. STOCK_CODE -> .SZ/.SH（以 RTN 列名集合为准）
     valid = set(stock_cols)
@@ -262,13 +299,16 @@ def main():
     fc["stock"] = fc["STOCK_CODE"].map(to_code)
     log(f"  映射失败(丢弃): {int(fc['stock'].isna().sum())} / {len(fc)}")
     fc = fc[fc["stock"].notna()]
+    if fc.empty:
+        raise ValueError("股票代码映射后没有可评测记录")
 
-    # 5. CREATE_DATE asof 对齐到 >= 的最近交易日
-    pos = np.searchsorted(trade_dates, fc["CREATE_DATE"].values, side="left")
-    pos = np.clip(pos, 0, len(trade_dates) - 1)
-    fc["date"] = pd.to_datetime(trade_dates[pos])
+    # 5. 按 14:57 将发布时间对齐到市场可用交易日；越界不做末日裁剪。
+    fc["date"] = align_to_trading_day(fc["CREATE_DATE"], trade_dates)
+    fc = fc[fc["date"].notna()]
     fc = fc[(fc["date"] >= START) & (fc["date"] <= END)]
     log(f"  对齐后 rows = {len(fc)}")
+    if fc.empty:
+        raise ValueError("按交易日对齐和评测窗口过滤后没有记录")
 
     # 6. (date, stock) 聚合：数值因子中位数，评级众数
     log("聚合到 (date, stock) ...")
@@ -277,6 +317,8 @@ def main():
     panel["rating"] = g["GG_RATING_CODE"].agg(rating_consensus)
     panel = panel.reset_index()
     log(f"  panel rows = {len(panel)}")
+    if panel.empty:
+        raise ValueError("聚合后因子面板为空")
 
     # 7. 并入 4 档未来收益（stack 成长表）
     log("并入未来收益 ...")
@@ -291,12 +333,18 @@ def main():
     rtn_long = rtn_long.reset_index()
     panel = panel.merge(rtn_long, on=["date", "stock"], how="inner")
     log(f"  合并收益后 rows = {len(panel)}")
+    if panel.empty:
+        raise ValueError("因子面板与收益数据没有重合的 (date, stock)")
 
     # 8. 并入行业 / 市值
     log("读取 Barra 行业 / 市值 ...")
 
     def read_barra_long(path, name):
         d = pd.read_hdf(path, key="df")
+        d.index = pd.to_datetime(d.index, errors="coerce", format="mixed").normalize()
+        d = d[d.index.notna()]
+        if d.index.duplicated().any():
+            raise ValueError(f"{path} 含重复日期")
         d = d.loc[(d.index >= pd.Timestamp(START)) & (d.index <= pd.Timestamp(END))]
         s = d.stack(dropna=False).rename(name)
         s.index.names = ["date", "stock"]
@@ -339,7 +387,7 @@ def main():
         for date, g in panel.groupby("date"):
             gg = g.dropna(subset=["rating", r])
             l = gg.loc[gg["rating"] == 7, r]
-            s_ = gg.loc[gg["rating"] == 5, r]
+            s_ = gg.loc[gg["rating"] == 1, r]
             if len(l) < 5 or len(s_) < 5:
                 spreads.append(np.nan)
             else:
@@ -347,24 +395,39 @@ def main():
         spreads = np.asarray(spreads, dtype=float)
         m = spreads[np.isfinite(spreads)]
         if len(m) == 0:
-            ls_rows.append(dict(horizon=r, long="买入(7)", short="收集(5)",
+            ls_rows.append(dict(horizon=r, long="买入(7)", short="卖出(1)",
                                 n_days=0, mean_spread=np.nan,
                                 std_spread=np.nan, t_stat=np.nan))
         else:
-            std = float(m.std(ddof=1))
-            ls_rows.append(dict(horizon=r, long="买入(7)", short="收集(5)",
+            std = float(m.std(ddof=1)) if len(m) > 1 else np.nan
+            ls_rows.append(dict(horizon=r, long="买入(7)", short="卖出(1)",
                                 n_days=len(m), mean_spread=float(m.mean()),
                                 std_spread=std,
-                                t_stat=(float(m.mean() / std * np.sqrt(len(m))) if std > 0 else np.nan)))
+                                t_stat=(float(m.mean() / std * np.sqrt(len(m)))
+                                        if np.isfinite(std) and std > 0 else np.nan)))
     ls = pd.DataFrame(ls_rows)
 
     # 12. 落盘
     log("写入输出 ...")
-    panel.to_parquet(os.path.join(OUT, "neutralized_factors.parquet"), index=False)
-    summary.to_csv(os.path.join(OUT, "rank_ic_summary.csv"), index=False)
-    ts.to_csv(os.path.join(OUT, "rank_ic_timeseries.csv"), index=False)
-    grp.to_csv(os.path.join(OUT, "rating_group_returns.csv"), index=False)
-    ls.to_csv(os.path.join(OUT, "rating_longshort.csv"), index=False)
+    suffix = YEAR_MODE
+    panel.to_parquet(os.path.join(OUT, f"neutralized_factors_{suffix}.parquet"), index=False)
+    summary.to_csv(os.path.join(OUT, f"rank_ic_summary_{suffix}.csv"), index=False)
+    ts.to_csv(os.path.join(OUT, f"rank_ic_timeseries_{suffix}.csv"), index=False)
+    grp.to_csv(os.path.join(OUT, f"rating_group_returns_{suffix}.csv"), index=False)
+    ls.to_csv(os.path.join(OUT, f"rating_longshort_{suffix}.csv"), index=False)
+    with open(os.path.join(OUT, f"forecast_factor_metadata_{suffix}.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "year_mode": YEAR_MODE,
+                "market_time_cutoff": "14:57",
+                "market_date_rule": "<=14:57 same trading day; otherwise next trading day",
+                "evaluation_window": [START, END],
+                "rating_long_short": "buy(7) minus sell(1)",
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     print("\n" + "=" * 100)
     print("RankIC 汇总（ROE/OR/NP/EPS 已 MAD 中性化；rating 为有序评级）")
@@ -372,7 +435,7 @@ def main():
     print(summary.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print("\n评级分组收益（pooled）")
     print(grp.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
-    print("\n评级多空（买入 - 收集，逐日价差）")
+    print("\n评级多空（买入 - 卖出，逐日价差）")
     print(ls.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print("\n输出目录:", OUT)
 

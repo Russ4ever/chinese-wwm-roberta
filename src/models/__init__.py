@@ -1,1 +1,1 @@
-"""模型核心：checkpoint 安全加载、backbone/完整推理候选、pooling、Early-Exit 引擎。"""
+"""模型核心：checkpoint 安全加载、二分类推理候选与 pooling。"""

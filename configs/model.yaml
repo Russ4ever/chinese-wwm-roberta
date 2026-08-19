@@ -1,24 +1,6 @@
-# 二分类推理候选配置（瘦身后：仅推理路径、底座信息与稳定性参数）
+# 二分类推理路径配置。
 # 路径相对仓库根目录；支持 ${VAR:-default} 环境变量覆盖。
 
 paths:
   checkpoint: ${CKPT_PATH:-chinese-wwm-roberta.ckpt}
   base_model_dir: ${BASE_MODEL_DIR:-chinese-roberta-wwm-ext}
-  artifacts_dir: artifacts
-
-# 底座信息（hfl/chinese-roberta-wwm-ext）
-base_model:
-  name: hfl/chinese-roberta-wwm-ext
-  model_type: bert
-  num_hidden_layers: 12
-  hidden_size: 768
-  num_attention_heads: 12
-  intermediate_size: 3072
-  vocab_size: 21128
-
-# 推理稳定性参数
-inference:
-  max_length: 128
-  truncation: true
-  padding: true
-  dtype: float32

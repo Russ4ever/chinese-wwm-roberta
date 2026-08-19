@@ -1,17 +1,15 @@
-"""三种 pooling 的统一接口（P1）。
+"""三种 pooling 的统一接口。
 
-实现 CLS / pooler / masked-mean 三种 pooling，均可对 batch 输出 ``[batch, 768]``。
+实现 CLS / pooler / masked-mean 三种 pooling，均可对 batch 输出 ``[batch, hidden]``。
 
 - ``cls``:        ``hidden_states[:, 0]``
 - ``pooler``:     BERT 的 ``pooler_output``（``tanh(dense(CLS))``），可作用任意层 CLS
 - ``masked_mean``: 只对 ``attention_mask == 1`` 的 token 求均值
 
-``make_pooling_fn`` 返回 ``(hidden_states, attention_mask) -> [batch, hidden]``
-的可调用对象，供 modeling / heads / early_exit 复用。
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -25,7 +23,7 @@ def cls_pool(hidden_states: torch.Tensor) -> torch.Tensor:
 def masked_mean(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     """只对 attention_mask == 1 的 token 求均值。
 
-    reference (TODO §3.1):
+    计算方式：
         mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
         summed = (hidden * mask).sum(dim=1)
         denom = mask.sum(dim=1).clamp_min(1.0)
@@ -68,13 +66,3 @@ def apply_pooling(
             raise ValueError("pooling='masked_mean' 需要传入 attention_mask")
         return masked_mean(hidden_states, attention_mask)
     raise ValueError(f"未知 pooling: {pooling!r}（可选 cls / pooler / masked_mean）")
-
-
-def make_pooling_fn(
-    pooling: str, pooler: Optional[nn.Module] = None
-) -> Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]:
-    """构造 ``(hidden_states, attention_mask) -> [batch, hidden]`` 的池化函数。"""
-    def fn(hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return apply_pooling(pooling, hidden_states, attention_mask=attention_mask, pooler=pooler)
-
-    return fn

@@ -1,40 +1,85 @@
-# 大模型权重文件（无法上传 GitHub，>100MB 会被拒绝）
-# 模型文件建议上传到 HuggingFace Hub: https://huggingface.co/new
-chinese-wwm-roberta.ckpt
-chinese-roberta-wwm-ext/pytorch_model.bin
-chinese-roberta-wwm-ext/tf_model.h5
-chinese-roberta-wwm-ext/flax_model.msgpack
-chinese-roberta-wwm-ext/*.safetensors
-chinese-roberta-wwm-ext/.cache/
+# 本仓库只提交代码、配置、Notebook 与必要的公开说明。
 
-# 大产物 / 缓存（不提交 GitHub）
-artifacts/
+# 本地 Codex / agent 辅助文件（仅本机使用）
+/AGENTS.md
+/AGENTS.override.md
+/consensus_revision_label_design*.md
+/.codex/
+/README.md
+/docs/环境配置.md
+/scripts/git_env.sh
 
-# Python
+# 密钥与本地环境配置
+.env
+.env.*
+!.env.example
+*.local
+/src/data/fetch/config.py
+
+# 大模型权重（应发布到模型仓库，不提交 GitHub）
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.gguf
+pytorch_model.bin
+tf_model.h5
+flax_model.msgpack
+/chinese-roberta-wwm-ext/.cache/
+
+# 本地数据与序列化产物
+/data/
+/datasets/
+/filtered_data/
+*.csv
+*.parquet
+*.feather
+*.arrow
+*.jsonl
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.db
+*.sqlite
+*.sqlite3
+
+# 训练、评估与运行输出
+/artifacts/
+/outputs/
+/runs/
+/checkpoints/
+/logs/
+/wandb/
+/mlruns/
+*.log
+
+# Python 缓存、构建与虚拟环境
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
+env/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
 
 # Jupyter
 .ipynb_checkpoints/
 
-# 系统
+# 编辑器与操作系统
 .DS_Store
-
-# 数据获取脚本：凭据配置不入库
-src/data/fetch/config.py
-filtered_data/
-
-# 数据/产物文件（不提交 GitHub，只保留代码与配置）
-label_engineering/*.csv
-label_engineering/*.parquet
-label_engineering/v2/*.csv
-label_engineering/v2/*.parquet
-
-# 本地 agent 工作辅助与环境配置文档（含内网 IP/代理/token 等敏感信息，仅本地保留，不提交 GitHub）
-README.md
-docs/环境配置.md
-scripts/git_env.sh
+.idea/
+.vscode/
+*.swp
+*~

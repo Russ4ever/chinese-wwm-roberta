@@ -8,8 +8,6 @@
   缓存按 (month, max_length) 复用, 换 pooling / dtype / 单卡双卡 都不用重新 tokenize。
 
 用法:
-  conda activate nlp_fjq
-  cd /home/intern_fjq_2026/Projects/chinese-wwm-roberta
   python scripts/infer_social_text.py --month 202403 --gpus all
   python scripts/infer_social_text.py --month 202403 --gpus 0
   python scripts/infer_social_text.py --month 202403 --gpus 1 --dtype fp32
@@ -27,9 +25,8 @@
 from __future__ import annotations
 
 import argparse
-import json
-import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,11 +37,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from src.inference_cache import save_csv  # noqa: E402
+
+DEFAULT_TRADING_CALENDAR = os.environ.get(
+    "SOCIAL_TEXT_TRADING_CALENDAR",
+    os.path.join(ROOT, "data", "RTN_daily", "rtn_1d.parquet"),
+)
+
 
 def parse_args():
     ap = argparse.ArgumentParser(description="social_text 批量推理(预缓存版)")
     ap.add_argument("--month", required=True, help="月份, 如 202403")
-    ap.add_argument("--gpus", default="all", help="0 | 1 | all(双卡分片)")
+    ap.add_argument("--gpus", default="all", help="0 | 1 | 0,1 | all | cpu")
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--max-length", type=int, default=128)
     ap.add_argument("--pooling", default="cls", choices=["cls", "pooler", "masked_mean"])
@@ -54,27 +58,34 @@ def parse_args():
     ap.add_argument("--re-tokenize", action="store_true", help="忽略已有缓存强制重建")
     ap.add_argument("--data-dir", default=os.path.join(ROOT, "filtered_data"))
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "artifacts"))
+    ap.add_argument(
+        "--trading-calendar",
+        default=DEFAULT_TRADING_CALENDAR,
+        help="项目已有交易日文件（CSV/Parquet，含 date 列）",
+    )
     ap.add_argument("--part", type=int, default=None, help="[内部] 分片序号")
     ap.add_argument("--num-parts", type=int, default=1, help="[内部] 分片数")
-    return ap.parse_args()
+    args = ap.parse_args()
+    if not re.fullmatch(r"\d{6}", args.month):
+        ap.error("--month 必须是 YYYYMM，例如 202403")
+    month_number = int(args.month[4:])
+    if not 1 <= month_number <= 12:
+        ap.error("--month 的月份必须在 01..12")
+    for name in ("batch_size", "max_length", "num_parts"):
+        if getattr(args, name) <= 0:
+            ap.error(f"--{name.replace('_', '-')} 必须大于 0")
+    if args.limit is not None and args.limit <= 0:
+        ap.error("--limit 必须大于 0")
+    if args.token_workers is not None and args.token_workers <= 0:
+        ap.error("--token-workers 必须大于 0")
+    if args.part is not None and not 0 <= args.part < args.num_parts:
+        ap.error("--part 必须满足 0 <= part < num-parts")
+    return args
 
 
 # --------------------------------------------------------------------------- #
 # 预缓存
 # --------------------------------------------------------------------------- #
-def _tok_init(base_dir, max_length):
-    global _TOK, _MAXL
-    from transformers import BertTokenizerFast
-    _TOK = BertTokenizerFast.from_pretrained(base_dir, local_files_only=True)
-    _MAXL = max_length
-
-
-def _tok_worker(texts):
-    enc = _TOK(texts, truncation=True, padding="max_length", max_length=_MAXL,
-               return_tensors="np", return_attention_mask=False, return_token_type_ids=False)
-    return enc["input_ids"].astype("int32")
-
-
 def ensure_cache(args):
     """返回 (cache_npy, meta)。缓存失效(源文件变动或强制)则多进程 tokenize 重建。"""
     cache_dir = os.path.join(args.out_dir, "token_cache")
@@ -84,47 +95,66 @@ def ensure_cache(args):
     cache_meta = cache_npy + ".meta.json"
     data_path = os.path.join(args.data_dir, f"social_text_{args.month}.csv.gz")
 
-    st = os.stat(data_path)
-    src_sig = (int(st.st_mtime), int(st.st_size))
-
-    if os.path.exists(cache_npy) and os.path.exists(cache_meta) and not args.re_tokenize:
-        meta = json.load(open(cache_meta, encoding="utf-8"))
-        if meta.get("src") == list(src_sig) and meta.get("max_length") == args.max_length:
-            print(f"缓存复用: {cache_npy} (n={meta['n']})", flush=True)
-            return cache_npy, meta
-        print("缓存失效, 重建", flush=True)
-
     from src.config import load_yaml_config
+    from src.inference_cache import (
+        file_signature,
+        load_json_object,
+        save_json_object,
+        save_npy,
+        tokenize_texts_parallel,
+        tokenizer_signature,
+        validate_cached_ids,
+    )
+
     cfg = load_yaml_config(os.path.join(ROOT, "configs", "model.yaml"))
     base = os.path.join(ROOT, cfg["paths"]["base_model_dir"])
+    expected = {
+        "source": file_signature(data_path),
+        "max_length": args.max_length,
+        "tokenizer_sha256": tokenizer_signature(base),
+    }
 
-    from transformers import BertTokenizerFast
-    tok = BertTokenizerFast.from_pretrained(base, local_files_only=True)
-    pad = int(tok.pad_token_id)
-    del tok
+    if os.path.exists(cache_npy) and os.path.exists(cache_meta) and not args.re_tokenize:
+        try:
+            meta = load_json_object(cache_meta)
+            if all(meta.get(k) == v for k, v in expected.items()):
+                validate_cached_ids(
+                    cache_npy,
+                    n_rows=int(meta["n"]),
+                    max_length=args.max_length,
+                )
+                print(f"缓存复用: {cache_npy} (n={meta['n']})", flush=True)
+                return cache_npy, meta
+        except (OSError, TypeError, ValueError, KeyError):
+            pass
+        print("缓存失效, 重建", flush=True)
 
     import pandas as pd
     df = pd.read_csv(data_path)
+    required = {"id", "text", "symbol", "published_at", "source"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"输入 CSV 缺少必需列: {missing}")
     if args.limit is not None:
         df = df.iloc[: args.limit]
     n = len(df)
+    if n == 0:
+        raise ValueError(f"输入 CSV 没有可处理的行: {data_path}")
     texts = df["text"].fillna("").tolist()
 
-    nw = args.token_workers or min(32, (os.cpu_count() or 1))
-    slots = max(1, nw * 4)
-    step = max(1, (n + slots - 1) // slots)
-    chunks = [texts[i:i + step] for i in range(0, n, step)]
+    nw = args.token_workers if args.token_workers is not None else min(32, os.cpu_count() or 1)
     print(f"预 tokenize: {n} 条, max_length={args.max_length}, workers={nw}, "
-          f"{len(chunks)} 个分片", flush=True)
+          "开始构建缓存", flush=True)
     t0 = time.time()
-    ctx = multiprocessing.get_context("fork")
-    with ctx.Pool(nw, initializer=_tok_init, initargs=(base, args.max_length)) as pool:
-        results = pool.map(_tok_worker, chunks)
-    ids = np.concatenate(results, axis=0)
-    np.save(cache_npy, ids)
-    meta = {"n": int(n), "max_length": args.max_length,
-            "pad_token_id": pad, "src": list(src_sig)}
-    json.dump(meta, open(cache_meta, "w", encoding="utf-8"))
+    ids, pad = tokenize_texts_parallel(
+        texts,
+        base_dir=base,
+        max_length=args.max_length,
+        workers=nw,
+    )
+    save_npy(cache_npy, ids)
+    meta = {"n": int(n), "pad_token_id": pad, **expected}
+    save_json_object(cache_meta, meta)
     print(f"预 tokenize 完成: {cache_npy} 形状 {ids.shape}, "
           f"用时 {time.time()-t0:.1f}s ({n/max(time.time()-t0,1e-6):.0f} 条/s)", flush=True)
     return cache_npy, meta
@@ -143,8 +173,13 @@ def run_inference(args, cache_npy, meta, lo, hi):
     cfg = load_yaml_config(os.path.join(ROOT, "configs", "model.yaml"))
     base = os.path.join(ROOT, cfg["paths"]["base_model_dir"])
     ckpt = os.path.join(ROOT, cfg["paths"]["checkpoint"])
-    dtype = torch.float16 if args.dtype == "fp16" else torch.float32
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    wants_cpu = str(args.gpus).lower() == "cpu"
+    if not wants_cpu and not torch.cuda.is_available():
+        raise RuntimeError(f"请求 GPU {args.gpus}，但当前进程没有可用 CUDA 设备")
+    device = "cpu" if wants_cpu else "cuda"
+    if device == "cpu" and args.dtype == "fp16":
+        print("[warn] CPU 推理不使用 fp16，已回退到 fp32", flush=True)
+    dtype = torch.float16 if args.dtype == "fp16" and device == "cuda" else torch.float32
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
     print(f"[part {args.part}/{args.num_parts}] device={device} ({gpu_name}) "
           f"dtype={args.dtype} pooling={args.pooling} batch={args.batch_size}", flush=True)
@@ -158,9 +193,17 @@ def run_inference(args, cache_npy, meta, lo, hi):
         df = df.iloc[: args.limit]
     df = df.iloc[lo:hi].reset_index(drop=True)
     k = len(df)
+    if k != hi - lo:
+        raise ValueError(f"数据分片行数 {k} 与缓存范围 {hi - lo} 不一致")
     ids = df["id"].astype(str).tolist()
+    from src.trading_calendar import align_to_trading_day, load_trading_dates, parse_market_timestamps
+
+    timestamps = parse_market_timestamps(df["published_at"])
+    aligned_dates = align_to_trading_day(timestamps, load_trading_dates(args.trading_calendar))
 
     mm = np.load(cache_npy, mmap_mode="r")            # [N,128] int32, mmap 懒加载
+    if mm.shape != (int(meta["n"]), int(meta["max_length"])):
+        raise ValueError(f"缓存 shape 与元数据不一致: {mm.shape}")
     out0 = torch.empty(k, dtype=torch.float32)
     out1 = torch.empty(k, dtype=torch.float32)
 
@@ -191,8 +234,8 @@ def run_inference(args, cache_npy, meta, lo, hi):
         "class_1_prob": out1.numpy(),
         "symbol": df["symbol"].values,
         "published_at": df["published_at"].values,
-        "date": df["date"].values,
-        "available_date": df["available_date"].values,
+        "date": timestamps.dt.normalize().values,
+        "available_date": aligned_dates.values,
         "source": df["source"].values,
     })
 
@@ -204,19 +247,30 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    gpus = [g.strip() for g in str(args.gpus).split(",") if g.strip()]
-    if args.gpus == "all":
-        gpus = ["0", "1"]
+    requested = str(args.gpus).strip().lower()
+    if requested == "all":
+        import torch
+
+        gpus = [str(i) for i in range(torch.cuda.device_count())] or ["cpu"]
+    elif requested == "cpu":
+        gpus = ["cpu"]
+    else:
+        gpus = [g.strip() for g in requested.split(",") if g.strip()]
+        if not gpus or any(not g.isdigit() for g in gpus):
+            raise ValueError("--gpus 只能是整数列表、all 或 cpu")
+        if len(set(gpus)) != len(gpus):
+            raise ValueError("--gpus 不能重复指定同一个设备")
 
     out_tag = args.month if args.limit is None else f"{args.month}_lim{args.limit}"
     final = os.path.join(args.out_dir, f"social_text_probs_{out_tag}.csv")
 
     # 单卡 & 非分片子进程: 本进程缓存 + 前向
     if args.part is None and len(gpus) == 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1" if gpus[0] == "cpu" else gpus[0]
+        args.gpus = gpus[0]
         cache, meta = ensure_cache(args)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
         res = run_inference(args, cache, meta, 0, meta["n"])
-        res.to_csv(final, index=False)
+        save_csv(final, res)
         print("已保存:", final, "| 行数:", len(res), flush=True)
         print("NaN 校验:", int(res[["class_0_prob", "class_1_prob"]].isna().sum().sum()), flush=True)
         return 0
@@ -230,15 +284,17 @@ def main():
         step = (N + args.num_parts - 1) // args.num_parts
         lo = args.part * step
         hi = min(N, lo + step)
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1" if gpus[0] == "cpu" else gpus[0]
+        args.gpus = gpus[0]
         res = run_inference(args, cache, meta, lo, hi)
         shard = final.replace(".csv", f".part{args.part}.csv")
-        res.to_csv(shard, index=False)
+        save_csv(shard, res)
         print("分片已存:", shard, "| 行数:", len(res), flush=True)
         return 0
 
     # 双卡: 每卡一个子进程分片前向, 父进程合并
     procs, parts = [], []
+    gpus = gpus[:N]
     for part, gpu in enumerate(gpus):
         shard = final.replace(".csv", f".part{part}.csv")
         parts.append(shard)
@@ -249,7 +305,7 @@ def main():
             cmd += ["--" + k.replace("_", "-"), str(v)]
         cmd += ["--gpus", gpu, "--num-parts", str(len(gpus)), "--part", str(part)]
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu
+        env["CUDA_VISIBLE_DEVICES"] = "-1" if gpu == "cpu" else gpu
         print("启动子进程(GPU %s)" % gpu, flush=True)
         procs.append(subprocess.Popen(cmd, env=env))
 
@@ -260,7 +316,7 @@ def main():
 
     import pandas as pd
     merged = pd.concat([pd.read_csv(p) for p in parts], ignore_index=True)
-    merged.to_csv(final, index=False)
+    save_csv(final, merged)
     for p in parts:
         os.remove(p)
     print("已合并保存:", final, "| 行数:", len(merged), flush=True)

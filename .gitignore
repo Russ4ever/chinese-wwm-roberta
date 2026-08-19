@@ -1,0 +1,35 @@
+# 大模型权重文件（无法上传 GitHub，>100MB 会被拒绝）
+# 模型文件建议上传到 HuggingFace Hub: https://huggingface.co/new
+chinese-wwm-roberta.ckpt
+chinese-roberta-wwm-ext/pytorch_model.bin
+chinese-roberta-wwm-ext/tf_model.h5
+chinese-roberta-wwm-ext/flax_model.msgpack
+chinese-roberta-wwm-ext/*.safetensors
+chinese-roberta-wwm-ext/.cache/
+
+# 大产物 / 缓存（不提交 GitHub）
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 系统
+.DS_Store
+
+# 数据获取脚本：凭据配置不入库
+src/data/fetch/config.py
+filtered_data/
+
+# 数据/产物文件（不提交 GitHub，只保留代码与配置）
+label_engineering/*.csv
+label_engineering/*.parquet
+label_engineering/v2/*.csv
+label_engineering/v2/*.parquet

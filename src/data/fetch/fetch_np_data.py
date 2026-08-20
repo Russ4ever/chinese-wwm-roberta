@@ -1,67 +1,209 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""从 wind 镜像 Oracle 取 AShareIncome 利润表字段。
+"""从 Wind Oracle 增量导出年度合并利润表净利润。
 
-字段: S_INFO_WINDCODE, ANN_DT, REPORT_PERIOD, NET_PROFIT_INCL_MIN_INT_INC, ACTUAL_ANN_DT
-条件: ANN_DT 在 [20050101, 20260801] 闭区间(VARCHAR2 'YYYYMMDD', 字符串比较=日期序)
-输出: 与本脚本同目录 ashare_income_20050101_20260801.csv
-运行: /home/fanjingqi/software/miniconda3/envs/factors/bin/python fetch_ashare_income.py
+数据库连接只从 WIND_DB_USER/WIND_DB_PASSWORD/WIND_DB_DSN 读取。原始五列历史
+CSV不覆盖；默认另写年度合并口径五列 CSV 和用于 point-in-time 清洗的增强 Parquet。
 """
-import os
+
+from __future__ import annotations
+
+import argparse
 import csv
+import os
+import sys
 import time
+from pathlib import Path
 
-import oracledb
 
-WIND_USER = "lltz_db"
-WIND_PWD = "Lltz!2021"
-WIND_DSN = "10.23.153.15:21010/wind"
-
-START = "20050101"
-END = "20260801"
-
-COLUMNS = [
+BASE_COLUMNS = [
     "S_INFO_WINDCODE",
     "ANN_DT",
     "REPORT_PERIOD",
     "NET_PROFIT_INCL_MIN_INT_INC",
     "ACTUAL_ANN_DT",
 ]
-
-OUT_DIR = "/home/intern_fjq_2026/data/NLP/market"
-OUT_FILE = os.path.join(OUT_DIR, "ashare_np_20050101_20260801.csv")
-
-SQL = (
-    "SELECT " + ", ".join(COLUMNS)
-    + " FROM WIND.ASHAREINCOME"
-    + " WHERE ANN_DT >= :s AND ANN_DT <= :e"
-)
+ENRICHED_COLUMNS = BASE_COLUMNS + [
+    "STATEMENT_TYPE",
+    "NET_PROFIT_EXCL_MIN_INT_INC",
+    "OBJECT_ID",
+    "OPDATE",
+]
+DEFAULT_OUTPUT_DIR = Path("/home/intern_fjq_2026/data/NLP/market")
 
 
-def main():
-    oracledb.defaults.fetch_lobs = False
-    conn = oracledb.connect(user=WIND_USER, password=WIND_PWD, dsn=WIND_DSN)
-    cur = conn.cursor()
-    cur.arraysize = 1000
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="导出Wind年度合并净利润")
+    parser.add_argument("--start-date", default="20050101")
+    parser.add_argument("--end-date", default="20260801")
+    parser.add_argument("--batch-size", type=int, default=50_000)
+    parser.add_argument("--csv-output", default=None)
+    parser.add_argument("--parquet-output", default=None)
+    return parser.parse_args()
 
-    t0 = time.time()
-    cur.execute(SQL, s=START, e=END)
 
-    n = 0
-    with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(COLUMNS)
-        while True:
-            rows = cur.fetchmany(1000)
-            if not rows:
-                break
-            w.writerows(rows)
-            n += len(rows)
-            if n % 500000 == 0:
-                print("written %d rows (%.1fs)" % (n, time.time() - t0))
+def _credentials() -> tuple[str, str, str]:
+    names = ("WIND_DB_USER", "WIND_DB_PASSWORD", "WIND_DB_DSN")
+    values = tuple(os.environ.get(name, "").strip() for name in names)
+    missing = [name for name, value in zip(names, values) if not value]
+    if missing:
+        raise ValueError("缺少Wind数据库环境变量: " + ", ".join(missing))
+    return values  # type: ignore[return-value]
 
-    conn.close()
-    print("DONE: %d rows -> %s (%.1fs)" % (n, OUT_FILE, time.time() - t0))
+
+def _sql() -> str:
+    return (
+        "SELECT "
+        + ", ".join(ENRICHED_COLUMNS)
+        + " FROM WIND.ASHAREINCOME"
+        + " WHERE ACTUAL_ANN_DT >= :start_date AND ACTUAL_ANN_DT <= :end_date"
+        + " AND SUBSTR(REPORT_PERIOD, 5, 4) = '1231'"
+        + " AND STATEMENT_TYPE = '408001000'"
+        + " ORDER BY ACTUAL_ANN_DT, S_INFO_WINDCODE, REPORT_PERIOD, OBJECT_ID"
+    )
+
+
+def export(args: argparse.Namespace) -> dict[str, object]:
+    if len(args.start_date) != 8 or len(args.end_date) != 8:
+        raise ValueError("start-date/end-date 必须为YYYYMMDD")
+    if args.end_date < args.start_date:
+        raise ValueError("日期区间倒置")
+    if args.batch_size < 50_000:
+        raise ValueError("batch-size 不得低于50000")
+
+    csv_output = Path(
+        args.csv_output
+        or DEFAULT_OUTPUT_DIR
+        / f"ashare_np_annual_consolidated_{args.start_date}_{args.end_date}.csv"
+    ).expanduser()
+    parquet_output = Path(
+        args.parquet_output
+        or DEFAULT_OUTPUT_DIR
+        / f"ashare_np_enriched_{args.start_date}_{args.end_date}.parquet"
+    ).expanduser()
+    csv_output.parent.mkdir(parents=True, exist_ok=True)
+    parquet_output.parent.mkdir(parents=True, exist_ok=True)
+    csv_tmp = csv_output.with_name(csv_output.name + ".tmp")
+    parquet_tmp = parquet_output.with_name(parquet_output.name + ".tmp")
+
+    try:
+        import oracledb
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("导出要求安装 oracledb 与 pyarrow") from exc
+
+    user, password, dsn = _credentials()
+    started = time.perf_counter()
+    count = 0
+    writer = None
+    succeeded = False
+    connection = oracledb.connect(user=user, password=password, dsn=dsn)
+    try:
+        cursor = connection.cursor()
+        cursor.arraysize = args.batch_size
+        cursor.prefetchrows = args.batch_size
+        cursor.execute(_sql(), start_date=args.start_date, end_date=args.end_date)
+        with csv_tmp.open("w", newline="", encoding="utf-8") as csv_file:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow(BASE_COLUMNS)
+            while rows := cursor.fetchmany(args.batch_size):
+                columns = list(zip(*rows))
+                arrays = []
+                for name, values in zip(ENRICHED_COLUMNS, columns):
+                    if name in {
+                        "NET_PROFIT_INCL_MIN_INT_INC",
+                        "NET_PROFIT_EXCL_MIN_INT_INC",
+                    }:
+                        arrays.append(
+                            pa.array(values, type=pa.float64(), from_pandas=True)
+                        )
+                    else:
+                        arrays.append(
+                            pa.array(
+                                [
+                                    None if value is None else str(value)
+                                    for value in values
+                                ],
+                                type=pa.string(),
+                            )
+                        )
+                batch = pa.RecordBatch.from_arrays(arrays, ENRICHED_COLUMNS)
+                if writer is None:
+                    metadata = {
+                        b"actual_metric": b"net_profit_incl_min_int_inc",
+                        b"statement_type": b"408001000",
+                        b"date_filter": b"ACTUAL_ANN_DT",
+                    }
+                    schema = batch.schema.with_metadata(metadata)
+                    writer = pq.ParquetWriter(
+                        parquet_tmp, schema, compression="zstd", use_dictionary=True
+                    )
+                writer.write_batch(batch)
+                csv_writer.writerows(tuple(row[: len(BASE_COLUMNS)]) for row in rows)
+                count += len(rows)
+                if count % 500_000 < len(rows):
+                    elapsed = max(time.perf_counter() - started, 1e-9)
+                    print(
+                        f"written {count:,} rows ({count / elapsed:,.0f} rows/s)",
+                        flush=True,
+                    )
+        if writer is None:
+            empty_schema = pa.schema(
+                [
+                    (
+                        name,
+                        (
+                            pa.float64()
+                            if name
+                            in {
+                                "NET_PROFIT_INCL_MIN_INT_INC",
+                                "NET_PROFIT_EXCL_MIN_INT_INC",
+                            }
+                            else pa.string()
+                        ),
+                    )
+                    for name in ENRICHED_COLUMNS
+                ],
+                metadata={
+                    b"actual_metric": b"net_profit_incl_min_int_inc",
+                    b"statement_type": b"408001000",
+                    b"date_filter": b"ACTUAL_ANN_DT",
+                },
+            )
+            writer = pq.ParquetWriter(parquet_tmp, empty_schema, compression="zstd")
+        writer.close()
+        writer = None
+        os.replace(csv_tmp, csv_output)
+        os.replace(parquet_tmp, parquet_output)
+        succeeded = True
+    finally:
+        if writer is not None:
+            writer.close()
+        connection.close()
+        if not succeeded:
+            for temporary in (csv_tmp, parquet_tmp):
+                if temporary.is_file():
+                    temporary.unlink()
+    elapsed = time.perf_counter() - started
+    return {
+        "rows": count,
+        "seconds": elapsed,
+        "rows_per_second": count / elapsed if elapsed else None,
+        "csv": str(csv_output),
+        "parquet": str(parquet_output),
+    }
+
+
+def main() -> int:
+    try:
+        result = export(parse_args())
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"[error] {exc}", file=sys.stderr, flush=True)
+        return 2
+    print(f"DONE: {result}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

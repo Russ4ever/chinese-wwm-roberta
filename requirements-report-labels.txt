@@ -1,0 +1,9 @@
+blake3>=1.0,<2
+numba>=0.59,<1
+numpy>=1.26,<3
+oracledb>=2,<4
+pandas>=2.2,<3
+polars>=1.27,<2
+pyarrow>=14,<24
+PyYAML>=6,<7
+threadpoolctl>=3.5,<4

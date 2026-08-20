@@ -30,6 +30,19 @@ build:
   min_active_orgs: 3
   min_probe_updates: 2
   forecast_np_unit_multiplier: 10000.0
+  # FORECAST_NP 本轮按“包含少数股东损益的净利润”口径解释。
+  forecast_metric: net_profit_incl_min_int_inc
+
+performance:
+  # 共享服务器模式会把线程硬限制在8以内，并继续服从调度器/cgroup约束。
+  shared_server: true
+  max_threads: 8
+  nice_increment: 5
+  blas_threads: 1
+
+cache:
+  enabled: true
+  directory: artifacts/report_label_cache
 
 output:
   directory: artifacts/report_labels

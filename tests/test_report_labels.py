@@ -4,8 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
-from label_engineering.build_report_labels import run
+from label_engineering.prepare_actuals import (
+    ACTUAL_METRIC,
+    ACTUAL_VERSION,
+    prepare_actuals,
+)
+from label_engineering.build_report_labels import load_actuals, run
 from src.report_labeling import (
     assign_point_in_time_scale,
     attach_actual_labels,
@@ -16,6 +22,7 @@ from src.report_labeling import (
     first_trading_date_on_or_after,
     validate_actual_scale,
 )
+from src.report_label_runtime import resolve_runtime_resources
 
 
 CALENDAR = pd.bdate_range("2023-01-02", "2025-12-31")
@@ -313,12 +320,26 @@ build:
   min_active_orgs: 3
   min_probe_updates: 2
   forecast_np_unit_multiplier: 1.0
+  forecast_metric: net_profit_incl_min_int_inc
+performance:
+  shared_server: true
+  max_threads: 2
+  nice_increment: 0
+  blas_threads: 1
+cache:
+  enabled: true
+  directory: {tmp_path / "cache"}
 output:
   directory: {output}
 """,
         encoding="utf-8",
     )
-    run(
+    first_metadata = run(
+        argparse.Namespace(
+            config=str(config), start_date=None, end_date=None, output_dir=None
+        )
+    )
+    second_metadata = run(
         argparse.Namespace(
             config=str(config), start_date=None, end_date=None, output_dir=None
         )
@@ -327,6 +348,7 @@ output:
     fy = pd.read_parquet(output / "report_fy_labels.parquet")
     confirmation = pd.read_parquet(output / "report_confirmation_labels.parquet")
     assert reports["title"].tolist() == ["目标报告"]
+    assert reports["text"].tolist() == ["目标报告。正文"]
     assert fy["title"].tolist() == ["目标报告"]
     assert len(confirmation) == 6  # 1/3个月 × 三种面板
     assert set(fy["actual_invalid_reason"]) == {"actual_source_unavailable"}
@@ -336,3 +358,182 @@ output:
     audit = pd.read_csv(output / "label_coverage_audit.csv")
     assert {"count", "total_count", "rate"}.issubset(audit.columns)
     assert audit["rate"].between(0, 1).all()
+    assert first_metadata["cache"]["hit"] is False
+    assert second_metadata["cache"]["hit"] is True
+    assert second_metadata["runtime"]["effective_threads"] <= 2
+    assert {
+        "report_cache_load_or_build",
+        "pre_consensus_and_scale",
+        "future_confirmation_and_audit",
+    }.issubset(second_metadata["runtime"]["stage_metrics"])
+    reports_path.write_text(
+        reports_path.read_text(encoding="utf-8")
+        + json.dumps(_record("Late", "2024-03-01", 130), ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    invalidated_metadata = run(
+        argparse.Namespace(
+            config=str(config), start_date=None, end_date=None, output_dir=None
+        )
+    )
+    assert invalidated_metadata["cache"]["hit"] is False
+    assert invalidated_metadata["cache"]["key"] != first_metadata["cache"]["key"]
+
+
+def test_numba_labels_are_deterministic_between_one_and_eight_threads():
+    import numba
+
+    _, _, histories, target = _scenario()
+    previous = numba.get_num_threads()
+    try:
+        numba.set_num_threads(1)
+        one = build_confirmation_labels(
+            target,
+            histories,
+            CALENDAR,
+            coverage_end=pd.Timestamp("2025-12-31"),
+            confirmation_months=[1, 3],
+            lookback_days=180,
+            min_peer_orgs=4,
+            min_active_orgs=3,
+            min_probe_updates=2,
+        )
+        numba.set_num_threads(min(8, numba.config.NUMBA_NUM_THREADS))
+        many = build_confirmation_labels(
+            target,
+            histories,
+            CALENDAR,
+            coverage_end=pd.Timestamp("2025-12-31"),
+            confirmation_months=[1, 3],
+            lookback_days=180,
+            min_peer_orgs=4,
+            min_active_orgs=3,
+            min_probe_updates=2,
+        )
+    finally:
+        numba.set_num_threads(previous)
+    pd.testing.assert_frame_equal(one, many, check_exact=True)
+
+
+def test_shared_server_runtime_never_exceeds_eight_or_scheduler_limit(monkeypatch):
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "4")
+    resources = resolve_runtime_resources(
+        {
+            "shared_server": True,
+            "max_threads": 32,
+            "nice_increment": 5,
+            "blas_threads": 1,
+        }
+    )
+    assert resources.configured_threads == 8
+    assert 1 <= resources.effective_threads <= 4
+
+
+def test_prepare_actuals_uses_first_actual_date_and_quarantines_conflicts(
+    tmp_path: Path,
+):
+    columns = {
+        "STATEMENT_TYPE": "408001000",
+        "NET_PROFIT_EXCL_MIN_INT_INC": 90.0,
+        "OPDATE": "20260101",
+    }
+    source = pd.DataFrame(
+        [
+            {
+                **columns,
+                "S_INFO_WINDCODE": "000001.SZ",
+                "ANN_DT": "20250401",
+                "REPORT_PERIOD": "20241231",
+                "NET_PROFIT_INCL_MIN_INT_INC": 100.0,
+                "ACTUAL_ANN_DT": "20250401",
+                "OBJECT_ID": "first-a",
+            },
+            {
+                **columns,
+                "S_INFO_WINDCODE": "000001.SZ",
+                "ANN_DT": "20250401",
+                "REPORT_PERIOD": "20241231",
+                "NET_PROFIT_INCL_MIN_INT_INC": 100.005,
+                "ACTUAL_ANN_DT": "20250401",
+                "OBJECT_ID": "first-b",
+            },
+            {
+                **columns,
+                "S_INFO_WINDCODE": "000001.SZ",
+                "ANN_DT": "20250501",
+                "REPORT_PERIOD": "20241231",
+                "NET_PROFIT_INCL_MIN_INT_INC": 110.0,
+                "ACTUAL_ANN_DT": "20250501",
+                "OBJECT_ID": "revision",
+            },
+            # 截图同类问题：同一股票、报告期、首次实际公告日却有明显不同数值。
+            {
+                **columns,
+                "S_INFO_WINDCODE": "301699.SZ",
+                "ANN_DT": "20251128",
+                "REPORT_PERIOD": "20251231",
+                "NET_PROFIT_INCL_MIN_INT_INC": 42_309_240.0,
+                "ACTUAL_ANN_DT": "20251128",
+                "OBJECT_ID": "conflict-a",
+            },
+            {
+                **columns,
+                "S_INFO_WINDCODE": "301699.SZ",
+                "ANN_DT": "20251128",
+                "REPORT_PERIOD": "20251231",
+                "NET_PROFIT_INCL_MIN_INT_INC": 262_825_000.0,
+                "ACTUAL_ANN_DT": "20251128",
+                "OBJECT_ID": "conflict-b",
+            },
+            {
+                **columns,
+                "S_INFO_WINDCODE": "000002.SZ",
+                "ANN_DT": "20250801",
+                "REPORT_PERIOD": "20250630",
+                "NET_PROFIT_INCL_MIN_INT_INC": -20.0,
+                "ACTUAL_ANN_DT": "20250801",
+                "OBJECT_ID": "quarterly",
+            },
+            {
+                **columns,
+                "S_INFO_WINDCODE": "A25082.SH",
+                "ANN_DT": "20251223",
+                "REPORT_PERIOD": "20241231",
+                "NET_PROFIT_INCL_MIN_INT_INC": -30.0,
+                "ACTUAL_ANN_DT": "20251223",
+                "OBJECT_ID": "bad-code",
+            },
+        ]
+    )
+    input_path = tmp_path / "ashare_np_enriched_20050101_20260801.parquet"
+    output_path = tmp_path / "clean.parquet"
+    conflicts_path = tmp_path / "conflicts.parquet"
+    audit_path = tmp_path / "audit.json"
+    source.to_parquet(input_path, index=False)
+
+    audit = prepare_actuals(input_path, output_path, conflicts_path, audit_path)
+    clean = pd.read_parquet(output_path)
+    conflicts = pd.read_parquet(conflicts_path)
+    assert clean[["stock_code", "fy"]].to_records(index=False).tolist() == [
+        ("000001", 2024)
+    ]
+    assert clean.loc[0, "actual_np"] == 100.0
+    assert str(clean.loc[0, "actual_known_date"]) == "2025-04-01"
+    assert clean.loc[0, "n_later_revisions"] == 1
+    assert clean.loc[0, "actual_metric"] == ACTUAL_METRIC
+    assert clean.loc[0, "actual_version"] == ACTUAL_VERSION
+    assert set(conflicts["stock_code"]) == {"301699"}
+    assert audit["counts"]["conflicting_groups"] == 1
+    assert audit["counts"]["invalid_reasons"] == {
+        "invalid_stock_code": 1,
+        "not_valid_annual_period": 1,
+    }
+    parquet_metadata = pq.read_metadata(output_path).metadata
+    assert parquet_metadata[b"actual_metric"].decode() == ACTUAL_METRIC
+    loaded, available, _ = load_actuals(
+        output_path, None, expected_metric=ACTUAL_METRIC
+    )
+    assert available and len(loaded) == 1
+    with np.testing.assert_raises_regex(ValueError, "预测指标"):
+        load_actuals(output_path, None, expected_metric="net_profit_excl_min_int_inc")

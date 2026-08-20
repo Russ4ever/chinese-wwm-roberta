@@ -6,16 +6,15 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,30 +22,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.config import load_yaml_config  # noqa: E402
-from src.report_labeling import (  # noqa: E402
-    LABEL_VERSION,
-    assign_point_in_time_scale,
-    attach_actual_labels,
-    attach_pre_consensus,
-    build_confirmation_labels,
-    build_coverage_audit,
-    build_org_histories,
-    canonicalize_report_rows,
-    validate_actual_scale,
-)
-from src.trading_calendar import load_trading_dates  # noqa: E402
-
-
-LIGHTWEIGHT_FIELDS = [
-    "ID",
-    "STOCK_CODE",
-    "ORGAN_NAME",
-    "AUTHOR_NAME",
-    "TITLE",
-    "CREATE_DATE",
-    "REPORT_YEAR",
-    "FORECAST_NP",
-]
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,15 +54,17 @@ def _date(value: object, name: str) -> pd.Timestamp | None:
     return pd.Timestamp(parsed).normalize()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1 << 20):
-            digest.update(chunk)
+def _blake3_file(path: Path, threads: int) -> str:
+    from blake3 import blake3
+
+    digest = blake3(max_threads=max(1, int(threads)))
+    digest.update_mmap(str(path))
     return digest.hexdigest()
 
 
-def _file_meta(path: Path | None) -> dict[str, object] | str:
+def _file_meta(
+    path: Path | None, *, threads: int, known_blake3: str | None = None
+) -> dict[str, object] | str:
     if path is None:
         return "unavailable"
     stat = path.stat()
@@ -95,7 +72,7 @@ def _file_meta(path: Path | None) -> dict[str, object] | str:
         "path": str(path),
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": _sha256_file(path),
+        "blake3": known_blake3 or _blake3_file(path, threads),
     }
 
 
@@ -142,104 +119,36 @@ def resolve_source_coverage(
     )
 
 
-def read_lightweight_jsonl(
-    path: Path,
-    *,
-    read_start: pd.Timestamp,
-    read_end: pd.Timestamp,
-) -> tuple[pd.DataFrame, dict[str, int]]:
-    rows: list[dict[str, object]] = []
-    stats = {"input_lines": 0, "bad_json": 0, "outside_read_window": 0}
-    start_text = read_start.strftime("%Y-%m-%d")
-    end_text = read_end.strftime("%Y-%m-%d")
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line_number, line in enumerate(handle, 1):
-            stats["input_lines"] += 1
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                stats["bad_json"] += 1
-                continue
-            if not isinstance(value, dict):
-                stats["bad_json"] += 1
-                continue
-            created = value.get("CREATE_DATE")
-            if (
-                not isinstance(created, str)
-                or not start_text <= created[:10] <= end_text
-            ):
-                stats["outside_read_window"] += 1
-                continue
-            row = {column: value.get(column) for column in LIGHTWEIGHT_FIELDS}
-            row["_line_number"] = line_number
-            rows.append(row)
-    return pd.DataFrame(rows), stats
-
-
-def hydrate_report_texts(
-    path: Path,
-    reports: pd.DataFrame,
-    label_rows: pd.DataFrame,
-) -> pd.DataFrame:
-    """第二遍只读取目标报告正文，避免把缓冲区全部 CONTENT 装入内存。"""
-    if reports.empty:
-        return reports
-    target_ids = set(reports["report_id"])
-    line_to_report: dict[int, str] = {}
-    for _, row in label_rows[label_rows["report_id"].isin(target_ids)].iterrows():
-        for line_number in json.loads(row["_line_numbers"]):
-            line_to_report[int(line_number)] = str(row["report_id"])
-    best: dict[str, tuple[str, str]] = {}
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line_number, line in enumerate(handle, 1):
-            report_id = line_to_report.get(line_number)
-            if report_id is None:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            title = str(value.get("TITLE") or "").strip()
-            content = str(value.get("CONTENT") or "").strip()
-            current = best.get(report_id)
-            if current is None or len(content) > len(current[1]):
-                best[report_id] = (title, content)
-    result = reports.copy().set_index("report_id")
-    for report_id, (title, content) in best.items():
-        result.loc[report_id, "title"] = title
-        result.loc[report_id, "content"] = content
-    result["text"] = np.where(
-        result["content"].fillna("").ne(""),
-        result["title"].fillna("") + "。" + result["content"].fillna(""),
-        result["title"].fillna(""),
-    )
-    return (
-        result.reset_index()
-        .sort_values(["available_date", "report_id"])
-        .reset_index(drop=True)
-    )
-
-
 def _read_tabular(path: Path) -> pd.DataFrame:
+    import polars as pl
+
     suffix = path.suffix.lower()
     if suffix in {".parquet", ".pq"}:
-        return pd.read_parquet(path)
+        return pl.read_parquet(path).to_pandas()
     if suffix in {".csv", ".txt"}:
-        return pd.read_csv(path)
+        return pl.read_csv(path, infer_schema_length=10_000).to_pandas()
     raise ValueError(f"不支持的数据格式 {suffix!r}: {path}；仅支持 CSV/Parquet")
 
 
 def load_actuals(
-    path: Path | None, schema_path: Path | None
+    path: Path | None, schema_path: Path | None, *, expected_metric: str
 ) -> tuple[pd.DataFrame, bool, dict[str, Any]]:
     if path is None:
         return pd.DataFrame(), False, {}
     if not path.is_file():
         raise FileNotFoundError(f"Actual 文件不存在: {path}")
     frame = _read_tabular(path)
+    parquet_metadata: dict[str, str] = {}
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        import pyarrow.parquet as pq
+
+        raw_metadata = pq.read_metadata(path).metadata or {}
+        parquet_metadata = {
+            key.decode("utf-8", errors="replace"): value.decode(
+                "utf-8", errors="replace"
+            )
+            for key, value in raw_metadata.items()
+        }
     schema: dict[str, Any] = (
         load_yaml_config(schema_path) if schema_path is not None else {}
     )
@@ -259,13 +168,57 @@ def load_actuals(
             raise ValueError(f"Actual filter 字段不存在: {column}")
         values = allowed if isinstance(allowed, list) else [allowed]
         frame = frame[frame[column].isin(values)]
+    if "actual_metric" not in frame:
+        raise ValueError(
+            "Actual缺少 actual_metric 声明；必须使用prepare_actuals.py产物或schema defaults显式声明"
+        )
+    actual_metrics = set(frame["actual_metric"].dropna().astype(str).str.strip())
+    if not actual_metrics and parquet_metadata.get("actual_metric"):
+        actual_metrics = {parquet_metadata["actual_metric"]}
+    if actual_metrics != {expected_metric}:
+        raise ValueError(
+            f"Actual指标{sorted(actual_metrics)}与预测指标{expected_metric!r}不一致"
+        )
+    if "actual_version" not in frame:
+        raise ValueError("Actual缺少 actual_version 声明")
+    expected_version = "annual_consolidated_first_actual_announcement"
+    versions = set(frame["actual_version"].dropna().astype(str).str.strip())
+    if not versions and parquet_metadata.get("actual_version"):
+        versions = {parquet_metadata["actual_version"]}
+    if versions != {expected_version}:
+        raise ValueError(
+            f"Actual版本必须为{expected_version!r}，实际为{sorted(versions)}"
+        )
+    if not frame.empty:
+        known = pd.to_datetime(
+            frame["actual_known_date"], errors="coerce"
+        ).dt.normalize()
+        published = pd.to_datetime(
+            frame["actual_publish_date"], errors="coerce"
+        ).dt.normalize()
+        if known.isna().any() or published.isna().any() or (known != published).any():
+            raise ValueError(
+                "首次披露Actual要求actual_known_date与actual_publish_date均等于ACTUAL_ANN_DT"
+            )
+        multipliers = (
+            pd.to_numeric(frame["unit_multiplier"], errors="coerce").dropna().unique()
+        )
+        if len(multipliers) != 1 or float(multipliers[0]) != 1.0:
+            raise ValueError(
+                "首次披露Actual必须已换算为人民币元，unit_multiplier必须为1"
+            )
+        currencies = set(frame["currency"].dropna().astype(str).str.upper())
+        if currencies != {"CNY"}:
+            raise ValueError(f"Actual币种必须为CNY，实际为{sorted(currencies)}")
     return frame, True, schema
 
 
 def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
+    import polars as pl
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    frame.to_parquet(temporary, index=False)
+    pl.from_pandas(frame).write_parquet(temporary, compression="zstd", statistics=True)
     os.replace(temporary, path)
 
 
@@ -285,10 +238,41 @@ def _atomic_json(value: dict[str, Any], path: Path) -> None:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    total_started = time.perf_counter()
+    stage_metrics: dict[str, dict[str, float | int | None]] = {}
+
+    def record_stage(name: str, started: float, rows: int | None = None) -> None:
+        seconds = time.perf_counter() - started
+        stage_metrics[name] = {
+            "seconds": seconds,
+            "rows": rows,
+            "rows_per_second": (
+                float(rows / seconds) if rows is not None and seconds > 0 else None
+            ),
+        }
+
     config_path = _path(args.config)
     if config_path is None or not config_path.is_file():
         raise FileNotFoundError(f"Label 配置不存在: {args.config}")
     config = load_yaml_config(config_path)
+    from src.report_label_runtime import configure_runtime, peak_rss_mb
+
+    resources = configure_runtime(config.get("performance", {}))
+    # 以下导入必须晚于线程配置，确保Polars和Numba不会各自占满整台服务器。
+    from src.report_label_cache import load_or_build_report_cache
+    from src.report_labeling import (
+        LABEL_VERSION,
+        assign_point_in_time_scale,
+        attach_actual_labels,
+        attach_pre_consensus,
+        build_confirmation_labels,
+        build_coverage_audit,
+        build_org_histories,
+        validate_actual_scale,
+        warm_numba_kernels,
+    )
+    from src.trading_calendar import load_trading_dates
+
     paths = config.get("paths", {})
     reports_path = _path(paths.get("reports"))
     calendar_path = _path(paths.get("trading_calendar"))
@@ -308,6 +292,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError(f"交易日历文件不存在: {calendar_path}")
 
     build = config.get("build", {})
+    forecast_metric = str(
+        build.get("forecast_metric", "net_profit_incl_min_int_inc")
+    ).strip()
+    if forecast_metric != "net_profit_incl_min_int_inc":
+        raise ValueError("本轮FORECAST_NP只支持已确认的net_profit_incl_min_int_inc口径")
     horizons = tuple(int(value) for value in build.get("forecast_horizons", [0, 1, 2]))
     confirmation_months = tuple(
         int(value) for value in build.get("confirmation_months", [1, 3])
@@ -348,7 +337,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         + pd.Timedelta(days=7),
     )
     date_column = str(config.get("calendar", {}).get("date_column", "date"))
+    calendar_started = time.perf_counter()
     trading_dates = load_trading_dates(calendar_path, date_column=date_column)
+    record_stage("calendar_load", calendar_started, len(trading_dates))
     # 允许日历只覆盖区间的一部分：逐条越界由 available_date/target_date 的
     # NaT 与删失标志处理；仅在二者完全不相交时阻止误配文件。
     if trading_dates.max() < read_start or trading_dates.min() > read_end:
@@ -357,22 +348,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"与读取区间 {read_start.date()}~{read_end.date()} 完全不相交"
         )
 
-    print(f"[1/6] 读取轻量预测行 {read_start.date()}~{read_end.date()}", flush=True)
-    raw, read_stats = read_lightweight_jsonl(
-        reports_path, read_start=read_start, read_end=read_end
+    cache_config = config.get("cache", {})
+    cache_directory = _path(
+        cache_config.get("directory", "artifacts/report_label_cache")
     )
-    if raw.empty:
-        raise ValueError("配置读取区间内没有研报预测记录")
-    reports, all_rows = canonicalize_report_rows(
-        raw,
+    if cache_directory is None:
+        raise ValueError("cache.directory不能为空")
+    print(
+        f"[1/6] 读取/构建单遍研报缓存 {read_start.date()}~{read_end.date()}",
+        flush=True,
+    )
+    stage_started = time.perf_counter()
+    calendar_stat = calendar_path.stat()
+    reports, all_rows, cache_info = load_or_build_report_cache(
+        reports_path,
+        cache_directory,
         trading_dates,
+        calendar_identity={
+            "path": str(calendar_path.resolve()),
+            "size": calendar_stat.st_size,
+            "mtime_ns": calendar_stat.st_mtime_ns,
+            "date_column": date_column,
+        },
         forecast_horizons=horizons,
         forecast_multiplier=float(build.get("forecast_np_unit_multiplier", 10000.0)),
+        read_start=read_start,
+        read_end=read_end,
+        enabled=bool(cache_config.get("enabled", False)),
+        hash_threads=resources.effective_threads,
     )
+    record_stage("report_cache_load_or_build", stage_started, len(all_rows))
     if all_rows.empty:
         raise ValueError("规范化后没有动态 FY0/FY1/FY2 预测记录")
 
+    warmup_started = time.perf_counter()
+    warm_numba_kernels()
+    numba_compile_seconds = time.perf_counter() - warmup_started
     print("[2/6] 构造发布前同行共识与 point-in-time scale", flush=True)
+    stage_started = time.perf_counter()
     histories = build_org_histories(all_rows)
     all_rows = attach_pre_consensus(
         all_rows,
@@ -393,20 +406,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if target_rows.empty:
         raise ValueError("Label 区间内没有可输出的报告×FY记录")
     target_ids = set(target_rows["report_id"])
-    reports = reports[reports["report_id"].isin(target_ids)].copy()
-    reports = hydrate_report_texts(reports_path, reports, target_rows)
+    reports = (
+        reports[reports["report_id"].isin(target_ids)]
+        .sort_values(["available_date", "report_id"])
+        .reset_index(drop=True)
+    )
+    record_stage("pre_consensus_and_scale", stage_started, len(all_rows))
 
     print("[3/6] 读取可选 Actual 并计算 Residual/Edge", flush=True)
+    stage_started = time.perf_counter()
     actuals, actual_available, actual_schema = load_actuals(
-        actual_path, actual_schema_path
+        actual_path, actual_schema_path, expected_metric=forecast_metric
     )
     fy_labels = attach_actual_labels(
         target_rows, actuals, actual_source_available=actual_available
     )
     actual_scale_ratio = validate_actual_scale(fy_labels) if actual_available else None
     fy_labels["label_version"] = LABEL_VERSION
+    record_stage("actual_residual_edge", stage_started, len(fy_labels))
 
     print("[4/6] 构造1/3个月三种同行面板 Future Confirmation", flush=True)
+    stage_started = time.perf_counter()
     confirmation = build_confirmation_labels(
         fy_labels,
         histories,
@@ -419,6 +439,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         min_probe_updates=int(build.get("min_probe_updates", 2)),
     )
     audit = build_coverage_audit(fy_labels, confirmation)
+    record_stage("future_confirmation_and_audit", stage_started, len(confirmation))
 
     output_value = (
         args.output_dir
@@ -429,6 +450,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if output_dir is None:
         raise ValueError("输出目录不能为空")
     print(f"[5/6] 写入 {output_dir}", flush=True)
+    stage_started = time.perf_counter()
     report_columns = [
         "report_id",
         "source_report_ids",
@@ -443,10 +465,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "available_date",
     ]
     _atomic_parquet(reports[report_columns], output_dir / "reports.parquet")
-    fy_output = fy_labels.drop(columns=["_line_numbers"], errors="ignore")
+    fy_output = fy_labels
     _atomic_parquet(fy_output, output_dir / "report_fy_labels.parquet")
     _atomic_parquet(confirmation, output_dir / "report_confirmation_labels.parquet")
     _atomic_csv(audit, output_dir / "label_coverage_audit.csv")
+    record_stage(
+        "output_write", stage_started, len(reports) + len(fy_output) + len(confirmation)
+    )
+
+    stage_started = time.perf_counter()
+    source_metadata = {
+        "reports": _file_meta(
+            reports_path,
+            threads=resources.effective_threads,
+            known_blake3=cache_info.get("source_blake3"),
+        ),
+        "trading_calendar": _file_meta(
+            calendar_path, threads=resources.effective_threads
+        ),
+        "actuals": (
+            _file_meta(actual_path, threads=resources.effective_threads)
+            if actual_available
+            else "unavailable"
+        ),
+        "actual_schema": (
+            _file_meta(actual_schema_path, threads=resources.effective_threads)
+            if actual_schema_path
+            else "unavailable"
+        ),
+    }
+    record_stage("source_fingerprints", stage_started)
+    import numba
+    import polars as pl
+
+    thread_pools = {
+        "numba_threads": numba.get_num_threads(),
+        "polars_threads": pl.thread_pool_size(),
+    }
 
     metadata: dict[str, Any] = {
         "label_version": LABEL_VERSION,
@@ -467,6 +522,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "forecast_np_unit_multiplier": float(
                 build.get("forecast_np_unit_multiplier", 10000.0)
             ),
+            "forecast_metric": forecast_metric,
+            "actual_metric_alignment": "user_confirmed_forecast_np_total_net_profit",
             "forecast_horizon_formula": "fy - year(available_date)",
             "scale_formula": "max(abs(consensus_pre), point_in_time_floor_by_horizon)",
             "currency": "CNY",
@@ -475,16 +532,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "calendar_end": str(trading_dates.max().date()),
             "actual_schema": actual_schema,
         },
-        "sources": {
-            "reports": _file_meta(reports_path),
-            "trading_calendar": _file_meta(calendar_path),
-            "actuals": _file_meta(actual_path) if actual_available else "unavailable",
-            "actual_schema": (
-                _file_meta(actual_schema_path) if actual_schema_path else "unavailable"
-            ),
+        "sources": source_metadata,
+        "runtime": {
+            **resources.to_dict(),
+            **thread_pools,
+            "numba_compile_or_cache_load_seconds": numba_compile_seconds,
+            "stage_metrics": stage_metrics,
+            "peak_rss_mb": peak_rss_mb(),
+            "total_seconds_before_metadata_write": time.perf_counter() - total_started,
         },
+        "cache": cache_info,
         "counts": {
-            **read_stats,
+            "source_rows": cache_info.get("source_rows"),
             "canonical_report_fy_rows_read": len(all_rows),
             "reports_output": len(reports),
             "report_fy_rows_output": len(fy_output),
@@ -499,6 +558,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "actual_scale_median_ratio": actual_scale_ratio,
         "notes": [
             "仅读取服务器已有文件，不联网、不访问数据库、不生成交易日历或 Actual",
+            "FORECAST_NP按用户确认的总净利润口径匹配NET_PROFIT_INCL_MIN_INT_INC",
             "同一 available_date 的其他报告从发布前基准与未来更新证据中保守排除",
             "正式无效 Label 为空；invalid_reason 记录原因",
             "1%/99% winsorization 留到未来 probe 的训练集阶段执行",
@@ -512,7 +572,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     try:
         run(parse_args())
-    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (
+        ImportError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        KeyError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"[error] {exc}", file=sys.stderr, flush=True)
         return 2
     return 0

@@ -9,13 +9,16 @@ columns:
   currency: currency
   source_id: source_id
   actual_version: actual_version
+  actual_metric: actual_metric
 
-# 源文件缺少这些整列时使用的默认值。若净利润单位为万元，将 multiplier 改为 10000。
+# canonical Actual 必须已换算为人民币元；缺省声明只用于兼容字段齐全的旧文件。
 defaults:
   unit_multiplier: 1.0
   currency: CNY
-  actual_version: annual_report_first
+  actual_version: annual_consolidated_first_actual_announcement
+  actual_metric: net_profit_incl_min_int_inc
 
 # 只保留首次正式年报版本；源数据编码不同时修改右侧值。
 filters:
-  actual_version: [annual_report_first]
+  actual_version: [annual_consolidated_first_actual_announcement]
+  actual_metric: [net_profit_incl_min_int_inc]

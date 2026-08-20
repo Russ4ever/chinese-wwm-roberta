@@ -10,10 +10,11 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal, Mapping, Sequence, cast
+from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+from numba import njit, prange
 
 from .trading_calendar import (
     align_to_trading_day,
@@ -151,8 +152,10 @@ def canonicalize_report_rows(
     frame["source_report_id"] = source_ids.mask(source_ids.eq(""), fallback)
 
     report_source_ids = (
-        frame.groupby("report_id")["source_report_id"]
-        .apply(lambda s: json.dumps(sorted(set(map(str, s))), ensure_ascii=False))
+        frame.groupby("report_id", sort=False)["source_report_id"]
+        .agg(
+            lambda values: json.dumps(sorted(set(map(str, values))), ensure_ascii=False)
+        )
         .rename("source_report_ids")
     )
     content_length = frame["content"].str.len()
@@ -181,47 +184,70 @@ def canonicalize_report_rows(
         drop=True
     )
 
-    grouped_rows: list[dict[str, object]] = []
-    group_cols = ["report_id", "fy"]
-    for (_, _), group in frame.groupby(group_cols, sort=False):
-        values = group["forecast_new"].to_numpy(dtype=float)
-        conflict = not np.allclose(values, values[0], rtol=1e-9, atol=1e-6)
-        first = group.sort_values(["publish_timestamp", "source_report_id"]).iloc[0]
-        grouped_rows.append(
-            {
-                "report_id": first["report_id"],
-                "source_report_ids": json.dumps(
-                    sorted(set(map(str, group["source_report_id"]))), ensure_ascii=False
-                ),
-                "stock_code": first["stock_code"],
-                "org_id": first["org_id"],
-                "author_name": first["author_name"],
-                "title": first["title"],
-                "publish_timestamp": first["publish_timestamp"],
-                "publish_date": first["publish_date"],
-                "available_date": first["available_date"],
-                "fy": int(first["fy"]),
-                "forecast_horizon": int(first["forecast_horizon"]),
-                # 冲突行只保留证据，不为该报告猜测一个可用预测值。
-                "forecast_new": np.nan if conflict else float(values[0]),
-                "forecast_values": json.dumps(
-                    sorted(set(map(float, values))), ensure_ascii=False
-                ),
-                "forecast_conflict": int(conflict),
-                "n_source_rows": int(len(group)),
-                "_line_numbers": json.dumps(
-                    sorted(
-                        set(
-                            map(
-                                int, group.get("_line_number", pd.Series([], dtype=int))
-                            )
-                        )
-                    ),
-                    ensure_ascii=False,
-                ),
-            }
+    import polars as pl
+
+    frame = frame.sort_values(
+        ["report_id", "fy", "publish_timestamp", "source_report_id"]
+    )
+    first_forecast = frame.groupby(["report_id", "fy"], sort=False)[
+        "forecast_new"
+    ].transform("first")
+    frame["_forecast_conflict_piece"] = (
+        frame["forecast_new"] - first_forecast
+    ).abs() > (1e-6 + 1e-9 * first_forecast.abs())
+    summary = (
+        pl.from_pandas(frame)
+        .group_by(["report_id", "fy"], maintain_order=True)
+        .agg(
+            pl.col("stock_code").first(),
+            pl.col("org_id").first(),
+            pl.col("author_name").first(),
+            pl.col("title").first(),
+            pl.col("publish_timestamp").first(),
+            pl.col("publish_date").first(),
+            pl.col("available_date").first(),
+            pl.col("forecast_horizon").first(),
+            pl.col("forecast_new").first(),
+            pl.col("source_report_id").unique().sort().alias("_source_ids"),
+            pl.col("forecast_new").unique().sort().alias("_forecast_values"),
+            pl.col("_forecast_conflict_piece")
+            .max()
+            .cast(pl.Int8)
+            .alias("forecast_conflict"),
+            pl.len().alias("n_source_rows"),
         )
-    rows = pd.DataFrame(grouped_rows)
+        .to_pandas()
+    )
+    summary["source_report_ids"] = summary.pop("_source_ids").map(
+        lambda values: json.dumps(list(values), ensure_ascii=False)
+    )
+    summary["forecast_values"] = summary.pop("_forecast_values").map(
+        lambda values: json.dumps(
+            [float(value) for value in values], ensure_ascii=False
+        )
+    )
+    summary.loc[summary["forecast_conflict"].eq(1), "forecast_new"] = np.nan
+    rows = summary[
+        [
+            "report_id",
+            "source_report_ids",
+            "stock_code",
+            "org_id",
+            "author_name",
+            "title",
+            "publish_timestamp",
+            "publish_date",
+            "available_date",
+            "fy",
+            "forecast_horizon",
+            "forecast_new",
+            "forecast_values",
+            "forecast_conflict",
+            "n_source_rows",
+        ]
+    ].copy()
+    rows["fy"] = rows["fy"].astype(int)
+    rows["forecast_horizon"] = rows["forecast_horizon"].astype(int)
     rows = rows.sort_values(
         ["stock_code", "fy", "available_date", "report_id"]
     ).reset_index(drop=True)
@@ -229,25 +255,24 @@ def canonicalize_report_rows(
 
 
 @dataclass(frozen=True)
-class OrgForecastSeries:
-    dates: np.ndarray
-    publish_dates: np.ndarray
-    values: np.ndarray
+class PackedHistories:
+    """Numba友好的股票×FY×机构预测历史压缩数组。"""
+
+    group_codes: dict[tuple[str, int], int]
+    org_codes: dict[str, int]
+    group_org_offsets: np.ndarray
+    org_ids: np.ndarray
+    org_event_offsets: np.ndarray
+    event_dates: np.ndarray
+    event_publish_dates: np.ndarray
+    event_values: np.ndarray
 
 
-@dataclass(frozen=True)
-class ForecastPoint:
-    position: int
-    available_date: pd.Timestamp
-    publish_date: pd.Timestamp
-    value: float
-
-
-OrgHistories = dict[tuple[str, int], dict[str, OrgForecastSeries]]
+OrgHistories = PackedHistories | dict[object, object]
 
 
 def build_org_histories(rows: pd.DataFrame) -> OrgHistories:
-    """按股票×FY构造机构日终预测历史。"""
+    """按股票×FY构造机构日终预测历史的连续数组。"""
     if rows.empty:
         return {}
     usable = rows[
@@ -257,78 +282,149 @@ def build_org_histories(rows: pd.DataFrame) -> OrgHistories:
     ]
     if usable.empty:
         return {}
+    import polars as pl
+
     daily = (
-        usable.groupby(["stock_code", "fy", "org_id", "available_date"], as_index=False)
-        .agg(forecast=("forecast_new", "median"), publish_date=("publish_date", "max"))
-        .sort_values(["stock_code", "fy", "org_id", "available_date"])
+        pl.from_pandas(
+            usable[
+                [
+                    "stock_code",
+                    "fy",
+                    "org_id",
+                    "available_date",
+                    "publish_date",
+                    "forecast_new",
+                ]
+            ]
+        )
+        .group_by(["stock_code", "fy", "org_id", "available_date"])
+        .agg(
+            pl.col("forecast_new").median().alias("forecast"),
+            pl.col("publish_date").max().alias("publish_date"),
+        )
+        .sort(["stock_code", "fy", "org_id", "available_date"])
+        .to_pandas()
     )
-    result: OrgHistories = {}
-    for key, group in daily.groupby(["stock_code", "fy"], sort=False):
-        per_org: dict[str, OrgForecastSeries] = {}
-        for org, org_group in group.groupby("org_id", sort=False):
-            per_org[str(org)] = OrgForecastSeries(
-                dates=org_group["available_date"].to_numpy(dtype="datetime64[ns]"),
-                publish_dates=org_group["publish_date"].to_numpy(
-                    dtype="datetime64[ns]"
-                ),
-                values=org_group["forecast"].to_numpy(dtype=float),
-            )
-        result[(str(key[0]), int(key[1]))] = per_org
-    return result
+    group_values = np.empty(len(daily), dtype=object)
+    group_values[:] = list(
+        zip(daily["stock_code"].astype(str), daily["fy"].astype(int))
+    )
+    group_ids, group_uniques = pd.factorize(group_values, sort=True)
+    org_ids, org_uniques = pd.factorize(daily["org_id"].astype(str), sort=True)
+    order = np.lexsort(
+        (
+            daily["available_date"].to_numpy(dtype="datetime64[D]").astype(np.int64),
+            org_ids,
+            group_ids,
+        )
+    )
+    group_ids = np.asarray(group_ids[order], dtype=np.int32)
+    org_ids = np.asarray(org_ids[order], dtype=np.int32)
+    event_dates = (
+        daily["available_date"].to_numpy(dtype="datetime64[D]").astype(np.int64)[order]
+    )
+    event_publish_dates = (
+        daily["publish_date"].to_numpy(dtype="datetime64[D]").astype(np.int64)[order]
+    )
+    event_values = daily["forecast"].to_numpy(dtype=np.float64)[order]
 
+    pair_starts = np.flatnonzero(
+        np.r_[True, (group_ids[1:] != group_ids[:-1]) | (org_ids[1:] != org_ids[:-1])]
+    ).astype(np.int64)
+    pair_groups = group_ids[pair_starts]
+    n_groups = len(group_uniques)
+    pair_counts = np.bincount(pair_groups, minlength=n_groups)
+    group_org_offsets = np.empty(n_groups + 1, dtype=np.int64)
+    group_org_offsets[0] = 0
+    np.cumsum(pair_counts, out=group_org_offsets[1:])
+    org_event_offsets = np.r_[pair_starts, len(event_dates)].astype(np.int64)
 
-def _point_at(
-    series: OrgForecastSeries, date: pd.Timestamp, *, strict: bool
-) -> ForecastPoint | None:
-    side: Literal["left", "right"] = "left" if strict else "right"
-    position = int(np.searchsorted(series.dates, np.datetime64(date), side=side)) - 1
-    if position < 0:
-        return None
-    return ForecastPoint(
-        position=position,
-        available_date=pd.Timestamp(series.dates[position]),
-        publish_date=pd.Timestamp(series.publish_dates[position]),
-        value=float(series.values[position]),
+    return PackedHistories(
+        group_codes={
+            (str(key[0]), int(key[1])): int(code)
+            for code, key in enumerate(group_uniques)
+        },
+        org_codes={str(org): int(code) for code, org in enumerate(org_uniques)},
+        group_org_offsets=group_org_offsets,
+        org_ids=org_ids[pair_starts],
+        org_event_offsets=org_event_offsets,
+        event_dates=event_dates,
+        event_publish_dates=event_publish_dates,
+        event_values=event_values,
     )
 
 
-def _updated_point(
-    series: OrgForecastSeries,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-) -> ForecastPoint | None:
-    point = _point_at(series, end, strict=False)
-    if point is None or point.available_date <= start:
-        return None
-    return point
+@njit(cache=True, inline="always")
+def _rightmost_event(
+    dates: np.ndarray, begin: int, end: int, target: int, strict: bool
+) -> int:
+    left = begin
+    right = end
+    while left < right:
+        middle = (left + right) // 2
+        if dates[middle] < target or (not strict and dates[middle] == target):
+            left = middle + 1
+        else:
+            right = middle
+    return left - 1
 
 
-def peer_snapshot(
-    histories: Mapping[str, OrgForecastSeries],
-    *,
-    origin_org: str,
-    date: pd.Timestamp,
+@njit(cache=True, inline="always")
+def _median_mad_numba(values: np.ndarray, count: int) -> tuple[float, float]:
+    selected = values[:count].copy()
+    median = np.median(selected)
+    deviations = np.empty(count, dtype=np.float64)
+    for index in range(count):
+        deviations[index] = abs(selected[index] - median)
+    return median, np.median(deviations)
+
+
+@njit(cache=True, parallel=True)
+def _pre_consensus_kernel(
+    row_groups: np.ndarray,
+    row_orgs: np.ndarray,
+    row_dates: np.ndarray,
+    group_org_offsets: np.ndarray,
+    history_orgs: np.ndarray,
+    org_event_offsets: np.ndarray,
+    event_dates: np.ndarray,
+    event_publish_dates: np.ndarray,
+    event_values: np.ndarray,
     lookback_days: int,
-    strict: bool,
-) -> dict[str, ForecastPoint]:
-    """返回指定时点的同行最新有效预测，始终排除原机构。"""
-    peers: dict[str, ForecastPoint] = {}
-    for org, series in histories.items():
-        if org == origin_org:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_rows = len(row_dates)
+    consensus = np.full(n_rows, np.nan)
+    mad = np.full(n_rows, np.nan)
+    counts = np.zeros(n_rows, dtype=np.int32)
+    for row_index in prange(n_rows):
+        group = row_groups[row_index]
+        if group < 0:
             continue
-        point = _point_at(series, date, strict=strict)
-        if point is None:
-            continue
-        if (date - point.publish_date).days <= lookback_days:
-            peers[org] = point
-    return peers
-
-
-def _median_mad(values: Sequence[float]) -> tuple[float, float]:
-    array = np.asarray(values, dtype=float)
-    median = float(np.median(array))
-    mad = float(np.median(np.abs(array - median)))
-    return median, mad
+        pair_begin = group_org_offsets[group]
+        pair_end = group_org_offsets[group + 1]
+        values = np.empty(pair_end - pair_begin, dtype=np.float64)
+        count = 0
+        target = row_dates[row_index]
+        for pair in range(pair_begin, pair_end):
+            if history_orgs[pair] == row_orgs[row_index]:
+                continue
+            event = _rightmost_event(
+                event_dates,
+                org_event_offsets[pair],
+                org_event_offsets[pair + 1],
+                target,
+                True,
+            )
+            if (
+                event >= org_event_offsets[pair]
+                and target - event_publish_dates[event] <= lookback_days
+            ):
+                values[count] = event_values[event]
+                count += 1
+        counts[row_index] = count
+        if count:
+            consensus[row_index], mad[row_index] = _median_mad_numba(values, count)
+    return consensus, mad, counts
 
 
 def attach_pre_consensus(
@@ -339,44 +435,58 @@ def attach_pre_consensus(
     lookback_days: int,
     min_peer_orgs: int,
 ) -> pd.DataFrame:
-    """为每个报告×FY附加发布前、排除本机构的同行共识。"""
+    """用并行压缩数组为报告×FY附加发布前同行共识。"""
     out = rows.copy()
-    consensus: list[float] = []
-    mad: list[float] = []
-    counts: list[int] = []
-    complete: list[int] = []
-    reasons: list[str | None] = []
-    for row in out.itertuples(index=False):
-        t = pd.Timestamp(row.available_date)
-        history_ok = coverage_start <= t - pd.Timedelta(days=lookback_days)
-        peers = peer_snapshot(
-            histories.get((str(row.stock_code), int(row.fy)), {}),
-            origin_org=str(row.org_id),
-            date=t,
-            lookback_days=lookback_days,
-            strict=True,
+    if isinstance(histories, dict):
+        consensus = np.full(len(out), np.nan)
+        mad = np.full(len(out), np.nan)
+        counts = np.zeros(len(out), dtype=np.int32)
+    else:
+        row_groups = np.asarray(
+            [
+                histories.group_codes.get((str(stock), int(fy)), -1)
+                for stock, fy in zip(out["stock_code"], out["fy"])
+            ],
+            dtype=np.int32,
         )
-        values = [point.value for point in peers.values()]
-        if values:
-            c, d = _median_mad(values)
-        else:
-            c = d = np.nan
-        consensus.append(c)
-        mad.append(d)
-        counts.append(len(values))
-        complete.append(int(history_ok))
-        if int(row.forecast_conflict) == 1:
-            reasons.append("conflicting_report_forecast")
-        elif not history_ok:
-            reasons.append("left_censored")
-        elif len(values) < min_peer_orgs:
-            reasons.append("insufficient_pre_peers")
-        else:
-            reasons.append(None)
+        row_orgs = np.asarray(
+            [histories.org_codes.get(str(org), -1) for org in out["org_id"]],
+            dtype=np.int32,
+        )
+        row_dates = (
+            out["available_date"].to_numpy(dtype="datetime64[D]").astype(np.int64)
+        )
+        consensus, mad, counts = _pre_consensus_kernel(
+            row_groups,
+            row_orgs,
+            row_dates,
+            histories.group_org_offsets,
+            histories.org_ids,
+            histories.org_event_offsets,
+            histories.event_dates,
+            histories.event_publish_dates,
+            histories.event_values,
+            int(lookback_days),
+        )
+    history_ok = (
+        out["available_date"] - pd.Timedelta(days=lookback_days) >= coverage_start
+    ).to_numpy()
+    reasons = np.full(len(out), None, dtype=object)
+    reasons[out["forecast_conflict"].to_numpy(dtype=int) == 1] = (
+        "conflicting_report_forecast"
+    )
+    reasons[(out["forecast_conflict"].to_numpy(dtype=int) != 1) & ~history_ok] = (
+        "left_censored"
+    )
+    reasons[
+        (out["forecast_conflict"].to_numpy(dtype=int) != 1)
+        & history_ok
+        & (counts < min_peer_orgs)
+    ] = "insufficient_pre_peers"
     out["consensus_pre"] = consensus
     out["mad_pre_abs"] = mad
     out["n_org_pre"] = counts
-    out["history_window_complete"] = complete
+    out["history_window_complete"] = history_ok.astype(int)
     out["pre_invalid_reason"] = reasons
     return out
 
@@ -388,48 +498,92 @@ def assign_point_in_time_scale(
     min_samples: int,
     floor_ratio: float = 0.01,
 ) -> pd.DataFrame:
-    """使用每月之前的历史共识拟合 point-in-time scale floor。"""
+    """使用搜索窗口而非全表重复布尔扫描拟合 point-in-time scale floor。"""
     if history_months <= 0 or min_samples <= 0 or floor_ratio <= 0:
         raise ValueError("scale 参数必须为正")
     out = rows.copy()
     months = out["available_date"].dt.to_period("M")
-    out["scale_reference"] = None
-    out["scale_sample_count"] = 0
-    out["scale_floor"] = np.nan
     valid_ref = out["consensus_pre"].notna() & out["pre_invalid_reason"].isna()
-    for month in sorted(months.dropna().unique()):
+    reference = out.loc[
+        valid_ref, ["available_date", "forecast_horizon", "consensus_pre"]
+    ].sort_values("available_date")
+    pooled_dates = reference["available_date"].to_numpy(dtype="datetime64[ns]")
+    pooled_values = reference["consensus_pre"].abs().to_numpy(dtype=float)
+    by_horizon: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for horizon, group in reference.groupby("forecast_horizon", sort=False):
+        by_horizon[int(horizon)] = (
+            group["available_date"].to_numpy(dtype="datetime64[ns]"),
+            group["consensus_pre"].abs().to_numpy(dtype=float),
+        )
+
+    lookup: list[dict[str, object]] = []
+    target_pairs = (
+        pd.DataFrame(
+            {"_scale_month": months, "forecast_horizon": out["forecast_horizon"]}
+        )
+        .dropna()
+        .drop_duplicates()
+        .sort_values(["_scale_month", "forecast_horizon"])
+    )
+    for month, horizon_value in target_pairs.itertuples(index=False, name=None):
+        horizon = int(horizon_value)
         month_start = month.start_time
         ref_start = (month - history_months).start_time
-        base_ref = (
-            valid_ref
-            & (out["available_date"] >= ref_start)
-            & (out["available_date"] < month_start)
+        start64 = np.datetime64(ref_start)
+        end64 = np.datetime64(month_start)
+        horizon_dates, horizon_values = by_horizon.get(
+            horizon, (np.empty(0, dtype="datetime64[ns]"), np.empty(0))
         )
-        target_month = months == month
-        for horizon in sorted(out.loc[target_month, "forecast_horizon"].unique()):
-            target = target_month & (out["forecast_horizon"] == horizon)
-            same = base_ref & (out["forecast_horizon"] == horizon)
-            if int(same.sum()) >= min_samples:
-                reference = same
-                reference_name = "same_horizon"
-            elif int(base_ref.sum()) >= min_samples:
-                reference = base_ref
-                reference_name = "pooled_horizon"
-            else:
-                continue
-            floor = floor_ratio * float(
-                np.median(np.abs(out.loc[reference, "consensus_pre"]))
-            )
-            floor = max(floor, float(np.finfo(float).eps))
-            out.loc[target, "scale_reference"] = reference_name
-            out.loc[target, "scale_sample_count"] = int(reference.sum())
-            out.loc[target, "scale_floor"] = floor
+        same_left = np.searchsorted(horizon_dates, start64, side="left")
+        same_right = np.searchsorted(horizon_dates, end64, side="left")
+        pooled_left = np.searchsorted(pooled_dates, start64, side="left")
+        pooled_right = np.searchsorted(pooled_dates, end64, side="left")
+        same_count = int(same_right - same_left)
+        pooled_count = int(pooled_right - pooled_left)
+        if same_count >= min_samples:
+            values = horizon_values[same_left:same_right]
+            reference_name = "same_horizon"
+            sample_count = same_count
+        elif pooled_count >= min_samples:
+            values = pooled_values[pooled_left:pooled_right]
+            reference_name = "pooled_horizon"
+            sample_count = pooled_count
+        else:
+            continue
+        floor = max(floor_ratio * float(np.median(values)), float(np.finfo(float).eps))
+        lookup.append(
+            {
+                "_scale_month": month,
+                "forecast_horizon": horizon,
+                "scale_reference": reference_name,
+                "scale_sample_count": sample_count,
+                "scale_floor": floor,
+            }
+        )
+    out["_scale_month"] = months
+    if lookup:
+        out = out.merge(
+            pd.DataFrame(lookup),
+            on=["_scale_month", "forecast_horizon"],
+            how="left",
+            sort=False,
+        )
+    else:
+        out["scale_reference"] = None
+        out["scale_sample_count"] = np.nan
+        out["scale_floor"] = np.nan
+    out["scale_sample_count"] = out["scale_sample_count"].fillna(0).astype(int)
+    out = out.drop(columns="_scale_month")
     out["scale_t"] = np.maximum(out["consensus_pre"].abs(), out["scale_floor"])
     out["dispersion_pre"] = MAD_SCALE * out["mad_pre_abs"] / out["scale_t"]
-    out["pre_state"] = [
-        profit_state(value, floor)
-        for value, floor in zip(out["consensus_pre"], out["scale_floor"])
-    ]
+    values = out["consensus_pre"].to_numpy(dtype=float)
+    floors = out["scale_floor"].to_numpy(dtype=float)
+    state = np.full(len(out), None, dtype=object)
+    finite = np.isfinite(values) & np.isfinite(floors)
+    state[finite & (np.abs(values) <= floors)] = "near_zero"
+    state[finite & (np.abs(values) > floors) & (values > 0)] = "profit"
+    state[finite & (np.abs(values) > floors) & (values < 0)] = "loss"
+    out["pre_state"] = state
     out["pre_label_valid"] = (
         out["pre_invalid_reason"].isna() & out["scale_floor"].notna()
     ).astype(int)
@@ -437,24 +591,6 @@ def assign_point_in_time_scale(
     missing_scale = out["pre_label_invalid_reason"].isna() & out["scale_floor"].isna()
     out.loc[missing_scale, "pre_label_invalid_reason"] = "insufficient_scale_history"
     return out
-
-
-def profit_state(value: object, floor: object) -> str | None:
-    if pd.isna(value) or pd.isna(floor):
-        return None
-    value_f = float(cast(Any, value))
-    floor_f = float(cast(Any, floor))
-    if abs(value_f) <= floor_f:
-        return "near_zero"
-    return "profit" if value_f > 0 else "loss"
-
-
-def transition_state(before: object, actual: object, floor: object) -> str | None:
-    before_state = profit_state(before, floor)
-    actual_state = profit_state(actual, floor)
-    if before_state is None or actual_state is None:
-        return None
-    return f"{before_state}_to_{actual_state}"
 
 
 def normalize_actuals(actuals: pd.DataFrame) -> pd.DataFrame:
@@ -469,6 +605,7 @@ def normalize_actuals(actuals: pd.DataFrame) -> pd.DataFrame:
         "currency",
         "source_id",
         "actual_version",
+        "actual_metric",
     ]
     if actuals.empty:
         return pd.DataFrame(columns=columns)
@@ -505,8 +642,11 @@ def normalize_actuals(actuals: pd.DataFrame) -> pd.DataFrame:
         frame["source_id"] = ""
     frame["source_id"] = _text(frame["source_id"])
     if "actual_version" not in frame:
-        frame["actual_version"] = "annual_report_first"
+        frame["actual_version"] = "annual_consolidated_first_actual_announcement"
     frame["actual_version"] = _text(frame["actual_version"])
+    if "actual_metric" not in frame:
+        frame["actual_metric"] = "net_profit_incl_min_int_inc"
+    frame["actual_metric"] = _text(frame["actual_metric"])
     valid = (
         frame["stock_code"].str.fullmatch(r"\d{6}", na=False)
         & frame["fy"].notna()
@@ -553,58 +693,56 @@ def attach_actual_labels(
         return out
 
     out = out.merge(normalized, on=["stock_code", "fy"], how="left")
-    residual: list[float] = []
-    report_error: list[float] = []
-    consensus_error: list[float] = []
-    edge: list[float] = []
-    signs: list[str | None] = []
-    days: list[float] = []
-    transitions: list[str | None] = []
-    valid_values: list[int] = []
-    reasons: list[str | None] = []
-    for row in out.itertuples(index=False):
-        reason: str | None = None
-        if int(row.pre_label_valid) != 1:
-            reason = str(row.pre_label_invalid_reason)
-        elif pd.isna(row.actual_np):
-            reason = "actual_missing"
-        elif pd.Timestamp(row.available_date) >= pd.Timestamp(row.actual_known_date):
-            reason = "report_not_before_actual_known_date"
-        if reason is None:
-            scale = float(row.scale_t)
-            actual = float(row.actual_np)
-            forecast = float(row.forecast_new)
-            pre = float(row.consensus_pre)
-            r = (actual - forecast) / scale
-            re = abs(actual - forecast) / scale
-            ce = abs(actual - pre) / scale
-            e = ce - re
-            residual.append(r)
-            report_error.append(re)
-            consensus_error.append(ce)
-            edge.append(e)
-            signs.append("positive" if e > 0 else ("negative" if e < 0 else "zero"))
-            days.append(
-                float(
-                    (
-                        pd.Timestamp(row.actual_publish_date)
-                        - pd.Timestamp(row.available_date)
-                    ).days
-                )
-            )
-            transitions.append(transition_state(pre, actual, row.scale_floor))
-            valid_values.append(1)
-            reasons.append(None)
-        else:
-            residual.append(np.nan)
-            report_error.append(np.nan)
-            consensus_error.append(np.nan)
-            edge.append(np.nan)
-            signs.append(None)
-            days.append(np.nan)
-            transitions.append(None)
-            valid_values.append(0)
-            reasons.append(reason)
+    reasons = np.full(len(out), None, dtype=object)
+    pre_invalid = out["pre_label_valid"].to_numpy(dtype=int) != 1
+    reasons[pre_invalid] = out.loc[pre_invalid, "pre_label_invalid_reason"].astype(str)
+    actual_missing = ~pre_invalid & out["actual_np"].isna().to_numpy()
+    reasons[actual_missing] = "actual_missing"
+    disclosed = (
+        ~pre_invalid
+        & ~actual_missing
+        & (out["available_date"] >= out["actual_known_date"]).to_numpy()
+    )
+    reasons[disclosed] = "report_not_before_actual_known_date"
+    valid = pd.isna(reasons)
+
+    actual = out["actual_np"].to_numpy(dtype=float)
+    forecast = out["forecast_new"].to_numpy(dtype=float)
+    pre = out["consensus_pre"].to_numpy(dtype=float)
+    scale = out["scale_t"].to_numpy(dtype=float)
+    residual = (actual - forecast) / scale
+    report_error = np.abs(actual - forecast) / scale
+    consensus_error = np.abs(actual - pre) / scale
+    edge = consensus_error - report_error
+    for values in (residual, report_error, consensus_error, edge):
+        values[~valid] = np.nan
+
+    signs = np.full(len(out), None, dtype=object)
+    signs[valid & (edge > 0)] = "positive"
+    signs[valid & (edge < 0)] = "negative"
+    signs[valid & (edge == 0)] = "zero"
+    days = (out["actual_publish_date"] - out["available_date"]).dt.days.to_numpy(
+        dtype=float
+    )
+    days[~valid] = np.nan
+
+    floor = out["scale_floor"].to_numpy(dtype=float)
+    before_states = np.full(len(out), None, dtype=object)
+    actual_states = np.full(len(out), None, dtype=object)
+    comparable = valid & np.isfinite(floor)
+    before_states[comparable & (np.abs(pre) <= floor)] = "near_zero"
+    before_states[comparable & (np.abs(pre) > floor) & (pre > 0)] = "profit"
+    before_states[comparable & (np.abs(pre) > floor) & (pre < 0)] = "loss"
+    actual_states[comparable & (np.abs(actual) <= floor)] = "near_zero"
+    actual_states[comparable & (np.abs(actual) > floor) & (actual > 0)] = "profit"
+    actual_states[comparable & (np.abs(actual) > floor) & (actual < 0)] = "loss"
+    transitions = np.full(len(out), None, dtype=object)
+    transition_valid = comparable & pd.notna(before_states) & pd.notna(actual_states)
+    transitions[transition_valid] = np.char.add(
+        np.char.add(before_states[transition_valid].astype(str), "_to_"),
+        actual_states[transition_valid].astype(str),
+    )
+
     out["residual_signed_raw"] = residual
     out["report_abs_error"] = report_error
     out["consensus_abs_error"] = consensus_error
@@ -613,8 +751,8 @@ def attach_actual_labels(
     out["days_to_actual"] = days
     out["actual_transition_state"] = transitions
     out["actual_label_available_date"] = out["actual_publish_date"]
-    out["residual_valid"] = valid_values
-    out["edge_valid"] = valid_values
+    out["residual_valid"] = valid.astype(int)
+    out["edge_valid"] = valid.astype(int)
     out["actual_invalid_reason"] = reasons
     return out
 
@@ -654,53 +792,219 @@ def first_trading_date_on_or_after(
     return pd.Timestamp(calendar[position]) if position < len(calendar) else pd.NaT
 
 
-def _panel_values(
-    panel: str,
-    histories: Mapping[str, OrgForecastSeries],
-    pre_peers: Mapping[str, ForecastPoint],
-    *,
-    origin_org: str,
-    start: pd.Timestamp,
-    target: pd.Timestamp,
+@njit(cache=True, parallel=True)
+def _confirmation_kernel(
+    row_groups: np.ndarray,
+    row_orgs: np.ndarray,
+    start_dates: np.ndarray,
+    target_dates: np.ndarray,
+    forecasts: np.ndarray,
+    scales: np.ndarray,
+    pre_valid: np.ndarray,
+    actual_known_dates: np.ndarray,
+    group_org_offsets: np.ndarray,
+    history_orgs: np.ndarray,
+    org_event_offsets: np.ndarray,
+    event_dates: np.ndarray,
+    event_publish_dates: np.ndarray,
+    event_values: np.ndarray,
+    coverage_end: int,
     lookback_days: int,
-) -> tuple[list[float], list[float], int, int, int]:
-    updated: dict[str, ForecastPoint] = {}
-    for org, old in pre_peers.items():
-        point = _updated_point(histories[org], start, target)
-        if point is not None:
-            updated[org] = point
+    min_peer_orgs: int,
+    min_active_orgs: int,
+    min_probe_updates: int,
+    nat_value: int,
+) -> tuple:
+    n_rows, n_horizons = target_dates.shape
+    total = n_rows * n_horizons * 3
+    consensus_pre = np.full(total, np.nan)
+    consensus_future = np.full(total, np.nan)
+    mad_pre = np.full(total, np.nan)
+    mad_future = np.full(total, np.nan)
+    dispersion_pre = np.full(total, np.nan)
+    dispersion_future = np.full(total, np.nan)
+    progress = np.full(total, np.nan)
+    progress_clipped = np.full(total, np.nan)
+    delta_dispersion = np.full(total, np.nan)
+    n_org_pre = np.zeros(total, dtype=np.int32)
+    n_org_future = np.zeros(total, dtype=np.int32)
+    n_updates = np.zeros(total, dtype=np.int32)
+    n_entries = np.zeros(total, dtype=np.int32)
+    n_exits = np.zeros(total, dtype=np.int32)
+    valid = np.zeros(total, dtype=np.int8)
+    probe_valid = np.zeros(total, dtype=np.int8)
+    reason = np.zeros(total, dtype=np.int8)
+    probe_reason = np.zeros(total, dtype=np.int8)
+    weights = np.zeros(total, dtype=np.float64)
 
-    if panel == "fixed":
-        pre_values = [point.value for point in pre_peers.values()]
-        future_values = [updated.get(org, old).value for org, old in pre_peers.items()]
-        return pre_values, future_values, len(updated), 0, 0
-    if panel == "active":
-        active_orgs = sorted(updated)
-        pre_values = [pre_peers[org].value for org in active_orgs]
-        future_values = [updated[org].value for org in active_orgs]
-        return pre_values, future_values, len(active_orgs), 0, 0
-    if panel != "market":
-        raise ValueError(f"未知同行面板: {panel}")
+    for task in prange(n_rows * n_horizons):
+        row = task // n_horizons
+        horizon = task - row * n_horizons
+        output_start = task * 3
+        target = target_dates[row, horizon]
+        if pre_valid[row] != 1:
+            reason[output_start : output_start + 3] = 1
+            continue
+        if target == nat_value or target > coverage_end:
+            reason[output_start : output_start + 3] = 2
+            continue
+        actual_date = actual_known_dates[row]
+        if actual_date != nat_value and target >= actual_date:
+            reason[output_start : output_start + 3] = 3
+            continue
+        group = row_groups[row]
+        if group < 0:
+            reason[output_start : output_start + 3] = 4
+            reason[output_start + 2] = 5
+            continue
 
-    future_peers: dict[str, ForecastPoint] = {}
-    for org, series in histories.items():
-        if org == origin_org:
-            continue
-        latest = _point_at(series, target, strict=False)
-        if latest is None:
-            continue
-        # 同一 available_date 的日内顺序不可识别：没有后续更新时退回发布前旧值。
-        if latest.available_date == start:
-            latest = pre_peers.get(org)
-            if latest is None:
+        pair_begin = group_org_offsets[group]
+        pair_end = group_org_offsets[group + 1]
+        capacity = pair_end - pair_begin
+        pre_values = np.empty(capacity, dtype=np.float64)
+        fixed_future_values = np.empty(capacity, dtype=np.float64)
+        active_pre_values = np.empty(capacity, dtype=np.float64)
+        active_future_values = np.empty(capacity, dtype=np.float64)
+        market_future_values = np.empty(capacity, dtype=np.float64)
+        pre_count = 0
+        active_count = 0
+        market_count = 0
+        entries = 0
+        exits = 0
+        start = start_dates[row]
+
+        for pair in range(pair_begin, pair_end):
+            if history_orgs[pair] == row_orgs[row]:
                 continue
-        if (target - latest.publish_date).days <= lookback_days:
-            future_peers[org] = latest
-    pre_values = [point.value for point in pre_peers.values()]
-    future_values = [point.value for point in future_peers.values()]
-    entries = len(set(future_peers).difference(pre_peers))
-    exits = len(set(pre_peers).difference(future_peers))
-    return pre_values, future_values, len(updated), entries, exits
+            event_begin = org_event_offsets[pair]
+            event_end = org_event_offsets[pair + 1]
+            pre_event = _rightmost_event(
+                event_dates, event_begin, event_end, start, True
+            )
+            has_pre = (
+                pre_event >= event_begin
+                and start - event_publish_dates[pre_event] <= lookback_days
+            )
+            latest_event = _rightmost_event(
+                event_dates, event_begin, event_end, target, False
+            )
+            has_update = (
+                has_pre
+                and latest_event >= event_begin
+                and event_dates[latest_event] > start
+            )
+
+            if has_pre:
+                old_value = event_values[pre_event]
+                pre_values[pre_count] = old_value
+                if has_update:
+                    fixed_future_values[pre_count] = event_values[latest_event]
+                    active_pre_values[active_count] = old_value
+                    active_future_values[active_count] = event_values[latest_event]
+                    active_count += 1
+                else:
+                    fixed_future_values[pre_count] = old_value
+                pre_count += 1
+
+            market_event = latest_event
+            if market_event >= event_begin and event_dates[market_event] == start:
+                market_event = pre_event if has_pre else event_begin - 1
+            has_market = (
+                market_event >= event_begin
+                and target - event_publish_dates[market_event] <= lookback_days
+            )
+            if has_market:
+                market_future_values[market_count] = event_values[market_event]
+                market_count += 1
+                if not has_pre:
+                    entries += 1
+            elif has_pre:
+                exits += 1
+
+        for panel in range(3):
+            output = output_start + panel
+            n_updates[output] = active_count
+            if panel == 0:
+                panel_pre = pre_values
+                panel_future = fixed_future_values
+                count_pre = pre_count
+                count_future = pre_count
+                required = min_peer_orgs
+            elif panel == 1:
+                panel_pre = pre_values
+                panel_future = market_future_values
+                count_pre = pre_count
+                count_future = market_count
+                required = min_peer_orgs
+                n_entries[output] = entries
+                n_exits[output] = exits
+            else:
+                panel_pre = active_pre_values
+                panel_future = active_future_values
+                count_pre = active_count
+                count_future = active_count
+                required = min_active_orgs
+            n_org_pre[output] = count_pre
+            n_org_future[output] = count_future
+            if count_pre < required or count_future < required:
+                reason[output] = 5 if panel == 2 else 4
+                continue
+
+            c_pre, panel_mad_pre = _median_mad_numba(panel_pre, count_pre)
+            c_future, panel_mad_future = _median_mad_numba(panel_future, count_future)
+            scale = scales[row]
+            d_pre = MAD_SCALE * panel_mad_pre / scale
+            d_future = MAD_SCALE * panel_mad_future / scale
+            gap = forecasts[row] - c_pre
+            inline_band = max(0.01, 0.5 * d_pre) * scale
+            consensus_pre[output] = c_pre
+            consensus_future[output] = c_future
+            mad_pre[output] = panel_mad_pre
+            mad_future[output] = panel_mad_future
+            dispersion_pre[output] = d_pre
+            dispersion_future[output] = d_future
+            if abs(gap) <= inline_band:
+                reason[output] = 6
+                continue
+
+            value = (c_future - c_pre) / gap
+            progress[output] = value
+            progress_clipped[output] = min(2.0, max(-1.0, value))
+            delta_dispersion[output] = math.log(
+                (d_future + DISPERSION_EPS) / (d_pre + DISPERSION_EPS)
+            )
+            coverage_weight = min(1.0, math.log1p(count_pre) / math.log(11.0))
+            update_weight = (
+                min(1.0, math.log1p(active_count) / math.log(4.0))
+                if active_count > 0
+                else 0.0
+            )
+            valid[output] = 1
+            is_probe_valid = panel == 2 or active_count >= min_probe_updates
+            probe_valid[output] = 1 if is_probe_valid else 0
+            probe_reason[output] = 0 if is_probe_valid else 1
+            weights[output] = math.sqrt(coverage_weight * update_weight)
+    return (
+        consensus_pre,
+        consensus_future,
+        mad_pre,
+        mad_future,
+        dispersion_pre,
+        dispersion_future,
+        progress,
+        progress_clipped,
+        delta_dispersion,
+        n_org_pre,
+        n_org_future,
+        n_updates,
+        n_entries,
+        n_exits,
+        valid,
+        probe_valid,
+        reason,
+        probe_reason,
+        weights,
+    )
 
 
 def build_confirmation_labels(
@@ -715,141 +1019,211 @@ def build_confirmation_labels(
     min_active_orgs: int,
     min_probe_updates: int,
 ) -> pd.DataFrame:
-    """构造 fixed/market/active 三种报告级未来确认 Label。"""
+    """一次同行扫描并行构造 fixed/market/active 三种未来确认 Label。"""
+    if rows.empty:
+        return pd.DataFrame()
     calendar = normalize_trading_dates(trading_dates)
-    output: list[dict[str, object]] = []
-    for row in rows.itertuples(index=False):
-        key = (str(row.stock_code), int(row.fy))
-        group_histories = histories.get(key, {})
-        start = pd.Timestamp(row.available_date)
-        pre_peers = peer_snapshot(
-            group_histories,
-            origin_org=str(row.org_id),
-            date=start,
-            lookback_days=lookback_days,
-            strict=True,
+    months_array = np.asarray(
+        [int(value) for value in confirmation_months], dtype=np.int32
+    )
+    n_rows = len(rows)
+    n_horizons = len(months_array)
+    start_series = pd.to_datetime(rows["available_date"])
+    calendar_days = calendar.to_numpy(dtype="datetime64[D]").astype(np.int64)
+    nat_value = np.datetime64("NaT", "D").astype(np.int64)
+    targets = np.full((n_rows, n_horizons), nat_value, dtype=np.int64)
+    for horizon_index, months in enumerate(months_array):
+        nominal = (
+            (start_series + pd.DateOffset(months=int(months)))
+            .to_numpy(dtype="datetime64[D]")
+            .astype(np.int64)
         )
-        for months in confirmation_months:
-            nominal_target = start + pd.DateOffset(months=int(months))
-            target = first_trading_date_on_or_after(nominal_target, calendar)
-            for panel in ("fixed", "market", "active"):
-                record: dict[str, object] = {
-                    "report_id": row.report_id,
-                    "stock_code": row.stock_code,
-                    "fy": int(row.fy),
-                    "forecast_horizon": int(row.forecast_horizon),
-                    "available_date": start,
-                    "confirmation_months": int(months),
-                    "peer_panel": panel,
-                    "target_date": target,
-                    "forecast_new": float(row.forecast_new),
-                    "scale_t": row.scale_t,
-                    "consensus_pre": np.nan,
-                    "consensus_future": np.nan,
-                    "mad_pre_abs": np.nan,
-                    "mad_future_abs": np.nan,
-                    "dispersion_pre": np.nan,
-                    "dispersion_future": np.nan,
-                    "progress_raw": np.nan,
-                    "progress_clipped": np.nan,
-                    "delta_log_dispersion": np.nan,
-                    "n_org_pre": 0,
-                    "n_org_future": 0,
-                    "n_peer_updates": 0,
-                    "n_org_entries": 0,
-                    "n_org_exits": 0,
-                    "confirmation_valid": 0,
-                    "confirmation_probe_valid": 0,
-                    "invalid_reason": None,
-                    "probe_invalid_reason": None,
-                    "sample_weight": 0.0,
-                    "label_available_date": target,
-                    "label_version": LABEL_VERSION,
-                }
-                reason: str | None = None
-                if int(row.pre_label_valid) != 1:
-                    reason = str(row.pre_label_invalid_reason)
-                elif pd.isna(target) or pd.Timestamp(target) > coverage_end:
-                    reason = "right_censored"
-                elif (
-                    hasattr(row, "actual_known_date")
-                    and pd.notna(row.actual_known_date)
-                    and target >= row.actual_known_date
-                ):
-                    reason = "crosses_actual_disclosure"
-                if reason is not None:
-                    record["invalid_reason"] = reason
-                    output.append(record)
-                    continue
+        positions = np.searchsorted(calendar_days, nominal, side="left")
+        valid_positions = positions < len(calendar_days)
+        targets[valid_positions, horizon_index] = calendar_days[
+            positions[valid_positions]
+        ]
 
-                pre_values, future_values, n_updates, entries, exits = _panel_values(
-                    panel,
-                    group_histories,
-                    pre_peers,
-                    origin_org=str(row.org_id),
-                    start=start,
-                    target=target,
-                    lookback_days=lookback_days,
-                )
-                required = min_active_orgs if panel == "active" else min_peer_orgs
-                record.update(
-                    n_org_pre=len(pre_values),
-                    n_org_future=len(future_values),
-                    n_peer_updates=n_updates,
-                    n_org_entries=entries,
-                    n_org_exits=exits,
-                )
-                if len(pre_values) < required or len(future_values) < required:
-                    record["invalid_reason"] = (
-                        "insufficient_active_peers"
-                        if panel == "active"
-                        else "insufficient_future_peers"
-                    )
-                    output.append(record)
-                    continue
+    if isinstance(histories, dict):
+        packed = PackedHistories(
+            {},
+            {},
+            np.zeros(1, dtype=np.int64),
+            np.empty(0, dtype=np.int32),
+            np.zeros(1, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=float),
+        )
+    else:
+        packed = histories
+    row_groups = np.asarray(
+        [
+            packed.group_codes.get((str(stock), int(fy)), -1)
+            for stock, fy in zip(rows["stock_code"], rows["fy"])
+        ],
+        dtype=np.int32,
+    )
+    row_orgs = np.asarray(
+        [packed.org_codes.get(str(org), -1) for org in rows["org_id"]], dtype=np.int32
+    )
+    start_days = start_series.to_numpy(dtype="datetime64[D]").astype(np.int64)
+    if "actual_known_date" in rows:
+        actual_days = (
+            pd.to_datetime(rows["actual_known_date"], errors="coerce")
+            .to_numpy(dtype="datetime64[D]")
+            .astype(np.int64)
+        )
+    else:
+        actual_days = np.full(n_rows, nat_value, dtype=np.int64)
+    results = _confirmation_kernel(
+        row_groups,
+        row_orgs,
+        start_days,
+        targets,
+        rows["forecast_new"].to_numpy(dtype=np.float64),
+        rows["scale_t"].to_numpy(dtype=np.float64),
+        rows["pre_label_valid"].to_numpy(dtype=np.int8),
+        actual_days,
+        packed.group_org_offsets,
+        packed.org_ids,
+        packed.org_event_offsets,
+        packed.event_dates,
+        packed.event_publish_dates,
+        packed.event_values,
+        np.datetime64(coverage_end.normalize(), "D").astype(np.int64),
+        int(lookback_days),
+        int(min_peer_orgs),
+        int(min_active_orgs),
+        int(min_probe_updates),
+        int(nat_value),
+    )
+    (
+        consensus_pre,
+        consensus_future,
+        mad_pre,
+        mad_future,
+        dispersion_pre,
+        dispersion_future,
+        progress,
+        progress_clipped,
+        delta_dispersion,
+        n_org_pre,
+        n_org_future,
+        n_updates,
+        n_entries,
+        n_exits,
+        valid,
+        probe_valid,
+        reason_codes,
+        probe_reason_codes,
+        weights,
+    ) = results
 
-                c_pre, mad_pre = _median_mad(pre_values)
-                c_future, mad_future = _median_mad(future_values)
-                scale = float(row.scale_t)
-                d_pre = MAD_SCALE * mad_pre / scale
-                d_future = MAD_SCALE * mad_future / scale
-                gap = float(row.forecast_new) - c_pre
-                inline_band = max(0.01, 0.5 * d_pre) * scale
-                record.update(
-                    consensus_pre=c_pre,
-                    consensus_future=c_future,
-                    mad_pre_abs=mad_pre,
-                    mad_future_abs=mad_future,
-                    dispersion_pre=d_pre,
-                    dispersion_future=d_future,
-                )
-                if abs(gap) <= inline_band:
-                    record["invalid_reason"] = "report_inline_with_consensus"
-                    output.append(record)
-                    continue
+    row_index = np.repeat(np.arange(n_rows), n_horizons * 3)
+    month_values = np.tile(np.repeat(months_array, 3), n_rows)
+    panels = np.tile(
+        np.asarray(["fixed", "market", "active"], dtype=object), n_rows * n_horizons
+    )
+    target_flat = (
+        np.repeat(targets.reshape(-1), 3)
+        .astype("datetime64[D]")
+        .astype("datetime64[ns]")
+    )
+    output = pd.DataFrame(
+        {
+            "report_id": rows["report_id"].to_numpy()[row_index],
+            "stock_code": rows["stock_code"].to_numpy()[row_index],
+            "fy": rows["fy"].to_numpy(dtype=int)[row_index],
+            "forecast_horizon": rows["forecast_horizon"].to_numpy(dtype=int)[row_index],
+            "available_date": start_series.to_numpy()[row_index],
+            "confirmation_months": month_values,
+            "peer_panel": panels,
+            "target_date": target_flat,
+            "forecast_new": rows["forecast_new"].to_numpy(dtype=float)[row_index],
+            "scale_t": rows["scale_t"].to_numpy(dtype=float)[row_index],
+            "consensus_pre": consensus_pre,
+            "consensus_future": consensus_future,
+            "mad_pre_abs": mad_pre,
+            "mad_future_abs": mad_future,
+            "dispersion_pre": dispersion_pre,
+            "dispersion_future": dispersion_future,
+            "progress_raw": progress,
+            "progress_clipped": progress_clipped,
+            "delta_log_dispersion": delta_dispersion,
+            "n_org_pre": n_org_pre,
+            "n_org_future": n_org_future,
+            "n_peer_updates": n_updates,
+            "n_org_entries": n_entries,
+            "n_org_exits": n_exits,
+            "confirmation_valid": valid,
+            "confirmation_probe_valid": probe_valid,
+            "sample_weight": weights,
+            "label_available_date": target_flat,
+            "label_version": LABEL_VERSION,
+        }
+    )
+    invalid_reason = np.full(len(output), None, dtype=object)
+    reason_mapping = {
+        2: "right_censored",
+        3: "crosses_actual_disclosure",
+        4: "insufficient_future_peers",
+        5: "insufficient_active_peers",
+        6: "report_inline_with_consensus",
+    }
+    for code, text in reason_mapping.items():
+        invalid_reason[reason_codes == code] = text
+    pre_reasons = rows["pre_label_invalid_reason"].to_numpy(dtype=object)[row_index]
+    invalid_reason[reason_codes == 1] = pre_reasons[reason_codes == 1]
+    output["invalid_reason"] = invalid_reason
+    output["probe_invalid_reason"] = np.where(
+        probe_reason_codes == 1, "insufficient_peer_updates", None
+    )
+    return output
 
-                progress = (c_future - c_pre) / gap
-                delta = math.log((d_future + DISPERSION_EPS) / (d_pre + DISPERSION_EPS))
-                coverage_weight = min(1.0, math.log1p(len(pre_values)) / math.log(11.0))
-                update_weight = (
-                    min(1.0, math.log1p(n_updates) / math.log(4.0))
-                    if n_updates
-                    else 0.0
-                )
-                probe_valid = panel == "active" or n_updates >= min_probe_updates
-                record.update(
-                    progress_raw=progress,
-                    progress_clipped=float(np.clip(progress, -1.0, 2.0)),
-                    delta_log_dispersion=delta,
-                    confirmation_valid=1,
-                    confirmation_probe_valid=int(probe_valid),
-                    probe_invalid_reason=(
-                        None if probe_valid else "insufficient_peer_updates"
-                    ),
-                    sample_weight=math.sqrt(coverage_weight * update_weight),
-                )
-                output.append(record)
-    return pd.DataFrame(output)
+
+def warm_numba_kernels() -> None:
+    """在正式计时前编译两个并行核；磁盘缓存命中时该步骤很快。"""
+    group_offsets = np.asarray([0, 1], dtype=np.int64)
+    org_ids = np.asarray([0], dtype=np.int32)
+    event_offsets = np.asarray([0, 1], dtype=np.int64)
+    event_dates = np.asarray([1], dtype=np.int64)
+    event_values = np.asarray([1.0], dtype=np.float64)
+    _pre_consensus_kernel(
+        np.asarray([0], dtype=np.int32),
+        np.asarray([1], dtype=np.int32),
+        np.asarray([2], dtype=np.int64),
+        group_offsets,
+        org_ids,
+        event_offsets,
+        event_dates,
+        event_dates,
+        event_values,
+        180,
+    )
+    nat_value = int(np.datetime64("NaT", "D").astype(np.int64))
+    _confirmation_kernel(
+        np.asarray([0], dtype=np.int32),
+        np.asarray([1], dtype=np.int32),
+        np.asarray([2], dtype=np.int64),
+        np.asarray([[3]], dtype=np.int64),
+        np.asarray([2.0], dtype=np.float64),
+        np.asarray([1.0], dtype=np.float64),
+        np.asarray([1], dtype=np.int8),
+        np.asarray([nat_value], dtype=np.int64),
+        group_offsets,
+        org_ids,
+        event_offsets,
+        event_dates,
+        event_dates,
+        event_values,
+        10,
+        180,
+        1,
+        1,
+        1,
+        nat_value,
+    )
 
 
 def build_coverage_audit(

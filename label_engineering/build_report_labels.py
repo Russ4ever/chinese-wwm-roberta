@@ -336,9 +336,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         + pd.DateOffset(months=max(confirmation_months))
         + pd.Timedelta(days=7),
     )
-    date_column = str(config.get("calendar", {}).get("date_column", "date"))
+    calendar_cfg = config.get("calendar", {})
+    date_column = str(calendar_cfg.get("date_column", "date"))
+    _date_format = calendar_cfg.get("date_format")
+    date_format = str(_date_format) if _date_format is not None else None
     calendar_started = time.perf_counter()
-    trading_dates = load_trading_dates(calendar_path, date_column=date_column)
+    trading_dates = load_trading_dates(
+        calendar_path, date_column=date_column, date_format=date_format
+    )
     record_stage("calendar_load", calendar_started, len(trading_dates))
     # 允许日历只覆盖区间的一部分：逐条越界由 available_date/target_date 的
     # NaT 与删失标志处理；仅在二者完全不相交时阻止误配文件。

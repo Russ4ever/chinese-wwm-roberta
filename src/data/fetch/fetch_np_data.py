@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """从 Wind Oracle 增量导出年度合并利润表净利润。
 
-数据库连接只从 WIND_DB_USER/WIND_DB_PASSWORD/WIND_DB_DSN 读取。原始五列历史
+数据库连接凭据从同目录 config.py 读取（WIND_USER/WIND_PWD/WIND_DSN）。原始五列历史
 CSV不覆盖；默认另写年度合并口径五列 CSV 和用于 point-in-time 清洗的增强 Parquet。
 """
 
@@ -14,7 +14,8 @@ import os
 import sys
 import time
 from pathlib import Path
-
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config as cfg
 
 BASE_COLUMNS = [
     "S_INFO_WINDCODE",
@@ -43,12 +44,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def _credentials() -> tuple[str, str, str]:
-    names = ("WIND_DB_USER", "WIND_DB_PASSWORD", "WIND_DB_DSN")
-    values = tuple(os.environ.get(name, "").strip() for name in names)
+    """从同目录 config.py 读取 Wind 镜像库凭据。"""
+    names = ("WIND_USER", "WIND_PWD", "WIND_DSN")
+    values = tuple(str(getattr(cfg, name, "") or "").strip() for name in names)
     missing = [name for name, value in zip(names, values) if not value]
     if missing:
-        raise ValueError("缺少Wind数据库环境变量: " + ", ".join(missing))
-    return values  # type: ignore[return-value]
+        raise ValueError("config.py 缺少 Wind 凭据: " + ", ".join(missing))
+    return values
 
 
 def _sql() -> str:
@@ -98,7 +100,10 @@ def export(args: argparse.Namespace) -> dict[str, object]:
     count = 0
     writer = None
     succeeded = False
-    connection = oracledb.connect(user=user, password=password, dsn=dsn)
+    try:
+        connection = oracledb.connect(user=user, password=password, dsn=dsn)
+    except oracledb.Error as exc:
+        raise RuntimeError(f"连接 Wind 数据库失败: {exc}") from exc
     try:
         cursor = connection.cursor()
         cursor.arraysize = args.batch_size
@@ -177,6 +182,8 @@ def export(args: argparse.Namespace) -> dict[str, object]:
         os.replace(csv_tmp, csv_output)
         os.replace(parquet_tmp, parquet_output)
         succeeded = True
+    except oracledb.Error as exc:
+        raise RuntimeError(f"Wind 数据库查询失败: {exc}") from exc
     finally:
         if writer is not None:
             writer.close()

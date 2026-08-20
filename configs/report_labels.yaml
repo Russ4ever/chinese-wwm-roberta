@@ -2,15 +2,16 @@
 # 服务器路径未知时保持为空；运行前通过环境变量或直接编辑本文件填写。
 
 paths:
-  reports: ${REPORT_LABEL_REPORTS_PATH:-}
-  trading_calendar: ${REPORT_LABEL_CALENDAR_PATH:-}
-  actuals: ${REPORT_LABEL_ACTUALS_PATH:-}
+  reports: /home/intern_fjq_2026/data/NLP/research_report/forecast_stk_20100101_20250831.jsonl
+  trading_calendar: /home/intern_fjq_2026/data/RTN_daily/trade_days.csv
+  actuals: /home/intern_fjq_2026/data/NLP/market/ashare_np_annual_first_20050101_20260801.parquet
   # actual_schema 的 columns 采用 canonical_field: source_field 映射；源字段已
   # 与标准字段一致时可留空，具体模板见 report_actual_schema.example.yaml。
   actual_schema: ${REPORT_LABEL_ACTUAL_SCHEMA_PATH:-}
 
 calendar:
-  date_column: date
+  date_column: trade_days
+  date_format: "%Y%m%d"
 
 coverage:
   # 可显式覆盖数据文件的真实覆盖边界；为空时依次读取 manifest、解析文件名。

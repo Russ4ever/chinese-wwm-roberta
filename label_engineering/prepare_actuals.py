@@ -30,7 +30,7 @@ REQUIRED_COLUMNS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="整理年度首次披露净利润 Actual")
-    parser.add_argument("--input", required=True, help="Wind增强CSV/Parquet")
+    parser.add_argument("--input", default="/home/intern_fjq_2026/data/NLP/market/ashare_np_enriched_20050101_20260801.parquet", help="Wind增强CSV/Parquet")
     parser.add_argument("--output", default=None, help="canonical Actual Parquet")
     parser.add_argument("--conflicts-output", default=None)
     parser.add_argument("--audit-output", default=None)

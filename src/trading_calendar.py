@@ -19,7 +19,7 @@ DEFAULT_CUTOFF = dt.time(14, 57)
 def parse_market_timestamps(values: pd.Series | Iterable[object]) -> pd.Series:
     """解析时间戳；带时区数据统一转换为上海时间后移除时区。"""
     source = values if isinstance(values, pd.Series) else pd.Series(values)
-    parsed = pd.to_datetime(source, errors="coerce", format="mixed")
+    parsed = pd.to_datetime(source, errors="coerce")
     if isinstance(parsed.dtype, pd.DatetimeTZDtype):
         parsed = parsed.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
     if not isinstance(parsed.dtype, np.dtype) or parsed.dtype.kind != "M":
@@ -27,9 +27,16 @@ def parse_market_timestamps(values: pd.Series | Iterable[object]) -> pd.Series:
     return parsed
 
 
-def normalize_trading_dates(values: Iterable[object]) -> pd.DatetimeIndex:
-    """清洗为升序、去重、无时区的交易日期索引。"""
-    parsed = pd.to_datetime(list(values), errors="coerce", format="mixed")
+def normalize_trading_dates(
+    values: Iterable[object],
+    date_format: str | None = None,
+) -> pd.DatetimeIndex:
+    """清洗为升序、去重、无时区的交易日期索引。
+
+    date_format 非空时按 strftime 格式解析（如 "%Y%m%d"）。
+    """
+    source = values if isinstance(values, pd.Series) else pd.Series(values)
+    parsed = pd.to_datetime(source, errors="coerce", format=date_format)
     dates = pd.DatetimeIndex(parsed).dropna()
     if dates.tz is not None:
         dates = dates.tz_convert("Asia/Shanghai").tz_localize(None)
@@ -39,7 +46,11 @@ def normalize_trading_dates(values: Iterable[object]) -> pd.DatetimeIndex:
     return dates
 
 
-def load_trading_dates(path: str | Path, date_column: str = "date") -> pd.DatetimeIndex:
+def load_trading_dates(
+    path: str | Path,
+    date_column: str = "date",
+    date_format: str | None = None,
+) -> pd.DatetimeIndex:
     """从现有 CSV/Parquet 文件读取交易日列。
 
     宽表只读取日期列，避免把全部股票行情载入内存。
@@ -62,7 +73,7 @@ def load_trading_dates(path: str | Path, date_column: str = "date") -> pd.Dateti
 
     if date_column not in frame.columns:
         raise ValueError(f"交易日历缺少日期列 {date_column!r}: {source}")
-    return normalize_trading_dates(frame[date_column])
+    return normalize_trading_dates(frame[date_column], date_format=date_format)
 
 
 def align_to_trading_day(

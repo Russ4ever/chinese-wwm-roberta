@@ -1,0 +1,85 @@
+# 六阶段逐层 Probe 管线。所有路径支持环境变量覆盖。
+# 默认不打开最终测试集；日期边界和标签映射必须由研究者显式确认。
+
+text:
+  path: ${LAYER_PROBE_TEXT_PATH:-artifacts/probe_dataset/probe_texts.parquet}
+  id_column: ${LAYER_PROBE_TEXT_ID_COLUMN:-report_id}
+  text_column: ${LAYER_PROBE_TEXT_COLUMN:-text}
+  symbol_column: ${LAYER_PROBE_SYMBOL_COLUMN:-stock_code}
+  date_column: ${LAYER_PROBE_DATE_COLUMN:-feature_available_date}
+  # 可为空；若标签已在文本表中，只配置 sentiment_label_column 即可。
+  sentiment_labels_path: ${LAYER_PROBE_SENTIMENT_LABEL_PATH:-}
+  sentiment_label_id_column: ${LAYER_PROBE_SENTIMENT_ID_COLUMN:-report_id}
+  sentiment_label_column: ${LAYER_PROBE_SENTIMENT_COLUMN:-sentiment_label}
+  limit: null
+
+model:
+  checkpoint: ${CKPT_PATH:-chinese-wwm-roberta.ckpt}
+  base_model_dir: ${BASE_MODEL_DIR:-chinese-roberta-wwm-ext}
+  device: ${LAYER_PROBE_DEVICE:-cuda}
+  compute_dtype: float16
+  storage_dtype: float16
+  batch_size: 128
+  max_length: 512
+  # 当前项目只能确认checkpoint里存在fc头；pooling/标签语义确认前不可下最终结论。
+  head_pooling: cls
+  head_pooling_confirmed: false
+
+time_splits:
+  # 必须按真实数据覆盖填写；三个窗口之间的空档就是额外隔离区。
+  train:
+    start: ${LAYER_PROBE_TRAIN_START:-}
+    end: ${LAYER_PROBE_TRAIN_END:-}
+  validation:
+    start: ${LAYER_PROBE_VALIDATION_START:-}
+    end: ${LAYER_PROBE_VALIDATION_END:-}
+  test:
+    start: ${LAYER_PROBE_TEST_START:-}
+    end: ${LAYER_PROBE_TEST_END:-}
+
+sentiment_probe:
+  c_grid: [0.01, 0.1, 1.0, 10.0]
+  positive_class_index: 1
+  label_mapping_confirmed: false
+  open_final_test: false
+
+returns:
+  # 项目现有specific return日表即行业调整收益；输入单位必须为小数。
+  industry_adjusted_daily_path: ${LAYER_PROBE_SPECIFIC_RETURN_DAILY:-/home/intern_fjq_2026/data/target/target_close_spret.h5}
+  hdf_key: null
+  horizons: [1, 5, 20]
+  primary_horizon: 5
+  # 用最长20日Label结束日清除跨越validation/test边界的样本。
+  purge_horizon: 20
+  storage_dtype: float16
+  aggregation_chunk_size: 16384
+
+exposures:
+  industry_path: ${LAYER_PROBE_INDUSTRY_PATH:-/home/intern_fjq_2026/data/barra/Barra_Industry.h5}
+  industry_hdf_key: null
+  size_path: ${LAYER_PROBE_SIZE_PATH:-/home/intern_fjq_2026/data/barra/Barra_SIZE.h5}
+  size_hdf_key: null
+
+return_probe:
+  target_column: target_return_rank_5d
+  alpha_grid: [0.1, 1.0, 10.0, 100.0, 1000.0]
+  min_daily_observations: 20
+  open_final_test: false
+
+cross_layer_factors:
+  middle_layers: [4, 5, 6, 7, 8]
+  deep_layers: [9, 10, 11, 12]
+  pca_components: 3
+
+strict_test:
+  quantiles: 5
+  # validation完成后、打开test之前预注册；示例名称见Notebook输出。
+  selected_factors: []
+  open_final_test: false
+
+output:
+  representations: artifacts/layer_probe/representations
+  sentiment_probe: artifacts/layer_probe/sentiment_probe
+  stock_day_panel: artifacts/layer_probe/stock_day_panel
+  return_probe: artifacts/layer_probe/return_probe
+  factor_validation: artifacts/layer_probe/factor_validation

@@ -1,0 +1,44 @@
+# 单篇研报 Label 经济意义验证。所有股票池与基准数据均按历史时点读取。
+
+paths:
+  report_labels: ${REPORT_LABEL_OUTPUT_DIR:-artifacts/report_labels}
+  report_history_cache: ${REPORT_LABEL_HISTORY_CACHE_PATH:-}
+  actuals: ${REPORT_LABEL_ACTUALS_PATH:-}
+  actual_schema: ${REPORT_LABEL_ACTUAL_SCHEMA_PATH:-}
+  trading_calendar: ${REPORT_LABEL_CALENDAR_PATH:-}
+  rtn_1d: /home/intern_fjq_2026/data/RTN_daily/rtn_1d.parquet
+  rtn_20d: /home/intern_fjq_2026/data/RTN_daily/rtn_20d.parquet
+  specific_return_daily: /home/intern_fjq_2026/data/target/target_close_spret.h5
+  specific_return_fut10: /home/intern_fjq_2026/data/target/target_close_spret_fut10.parquet
+  csi300_weights: ${CSI300_WEIGHTS_PATH:-}
+  csi300_index_prices: ${CSI300_INDEX_PRICES_PATH:-}
+
+calendar:
+  date_column: date
+  date_format: null
+
+validation:
+  years: [2024]
+  index_code: 000300.SH
+  return_windows: [1, 5, 10, 20]
+  actual_event_window: 10
+  lookback_days: 180
+  min_peer_orgs: 4
+  weight_coverage_min: 0.95
+  floor_ratio: 0.01
+  quantiles: 5
+  specific_return_hdf_key: null
+  # 输入均为小数收益；不对百分数做静默猜测或转换。
+  return_unit: decimal
+  consistency_atol: 1.0e-8
+  consistency_rtol: 1.0e-6
+  consistency_min_fraction: 0.99
+
+performance:
+  shared_server: true
+  max_threads: 8
+  nice_increment: 5
+  blas_threads: 1
+
+output:
+  directory: artifacts/report_label_economic_validation

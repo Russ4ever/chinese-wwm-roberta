@@ -19,7 +19,12 @@ DEFAULT_CUTOFF = dt.time(14, 57)
 def parse_market_timestamps(values: pd.Series | Iterable[object]) -> pd.Series:
     """解析时间戳；带时区数据统一转换为上海时间后移除时区。"""
     source = values if isinstance(values, pd.Series) else pd.Series(values)
-    parsed = pd.to_datetime(source, errors="coerce")
+    try:
+        # pandas >= 2 会根据首个非空值推断整列格式；显式允许
+        # “秒”和“小数秒”混合，避免 14:57:00.001 被静默转为 NaT。
+        parsed = pd.to_datetime(source, errors="coerce", format="mixed")
+    except (TypeError, ValueError):  # pandas < 2 不支持 format="mixed"
+        parsed = pd.to_datetime(source, errors="coerce")
     if isinstance(parsed.dtype, pd.DatetimeTZDtype):
         parsed = parsed.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
     if not isinstance(parsed.dtype, np.dtype) or parsed.dtype.kind != "M":

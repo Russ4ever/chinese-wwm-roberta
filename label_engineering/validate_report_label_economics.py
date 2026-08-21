@@ -92,6 +92,40 @@ def _resolve_history_cache(configured: Path | None, label_dir: Path) -> Path:
     return candidate
 
 
+def _truncate_by_coverage_end(
+    relevant_actuals: pd.DataFrame,
+    coverage_end: pd.Timestamp,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """将 actuals 截断到 coverage_end 之前，以便只验证具有完整研报窗口的记录。
+
+    当部分 Actual 的披露日晚于研报历史覆盖截止日时（例如 2023/2024 财年年报延至
+    次年中才披露），我们无法在其披露前构建完整的共识窗口。该函数剔除这些"超期"记录，
+    并返回被丢弃的行数供日志审计。
+    """
+    known_dates = pd.to_datetime(relevant_actuals["actual_known_date"], errors="coerce")
+    valid = known_dates.le(coverage_end.normalize())
+    total_rows = len(relevant_actuals)
+    kept_rows = int(valid.sum())
+    dropped_rows = total_rows - kept_rows
+    # Build a per-FY breakdown for the log
+    fy_col = "fy"
+    by_fy: dict[str, int] = {}
+    if fy_col in relevant_actuals.columns:
+        grouped = relevant_actuals[fy_col].dropna().astype(str)
+        valid_grouped = grouped[valid.to_numpy()]
+        invalid_grouped = grouped[~valid.to_numpy()]
+        for fy_val in grouped.unique():
+            total_fy = int((grouped == fy_val).sum())
+            kept_fy = int((valid_grouped == fy_val).sum())
+            by_fy[str(fy_val)] = {
+                "total": total_fy,
+                "kept": kept_fy,
+                "dropped": total_fy - kept_fy,
+            }
+    result = relevant_actuals.loc[valid.to_numpy()].copy()
+    return result, {"total": total_rows, "kept": kept_rows, "dropped": dropped_rows, "by_fy": by_fy}
+
+
 def _validate_history_coverage(
     label_metadata: dict[str, Any],
     relevant_actuals: pd.DataFrame,
@@ -269,6 +303,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     actual_schema_path = _path(paths.get("actual_schema"))
     actuals, _, _ = load_actuals(actual_path, actual_schema_path, expected_metric="net_profit_incl_min_int_inc")
     relevant_actuals = actuals[pd.to_numeric(actuals["fy"], errors="coerce").isin(years)]
+
+    # Truncate actuals to coverage_end so that we only validate records with a
+    # complete pre-disclosure consensus window (lookback_days of reports before each
+    # actual_known_date). Recent fiscal years often have disclosures after the report
+    # source cutoff, making their labels unverifiable.
+    metadata_cfg = label_metadata.get("configuration", {})
+    _coverage_end_raw = pd.to_datetime(
+        metadata_cfg.get("coverage_end"), errors="coerce"
+    )
+    if pd.isna(_coverage_end_raw):
+        raise ValueError("metadata 中缺少可解析的 coverage_end")
+    _coverage_end = _coverage_end_raw.normalize()
+    truncated_actuals, truncation_stats = _truncate_by_coverage_end(relevant_actuals, _coverage_end)
+    relevant_actuals = truncated_actuals
+    print("[info] actuals truncated by coverage_end={} stats={}".format(
+        _coverage_end.date(), truncation_stats), flush=True)
+
     lookback_days = int(validation.get("lookback_days", 180))
     coverage_start, coverage_end = _validate_history_coverage(
         label_metadata,

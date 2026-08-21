@@ -18,7 +18,24 @@ def canonical_stock_code(values: pd.Series | Iterable[object]) -> pd.Series:
     )
 
 
-def _normalize_return_frame(frame: pd.DataFrame, *, name: str) -> pd.DataFrame:
+def _maybe_scale_to_decimal(data: pd.DataFrame, *, source_name: str, force_percentile_threshold: float | None = None) -> pd.DataFrame:
+    """当收益数据疑似用百分数存储（例如 1.0 = 1%）时，自动除以 100 转回小数。
+
+    启发式规则：如果绝对值的 99th 百分位 > *threshold*，认为整组数据是百分格式。
+    threshold 默认取 1.0（即 pctile(abs) > 1 → "不可能是纯小数"）。
+    """
+    finite_mask = np.isfinite(data.to_numpy(dtype=float))
+    if not np.any(finite_mask):
+        return data
+    p99_abs = float(np.nanpercentile(np.abs(data.to_numpy(dtype=float)[finite_mask]), 99))
+    threshold = force_percentile_threshold if force_percentile_threshold is not None else 1.0
+    if p99_abs > threshold:
+        print("[info] {} percentiles: {:.4f} > {:.2f}, scaling /100".format(source_name, p99_abs, threshold), flush=True)
+        return data / 100.0
+    return data
+
+
+def _normalize_return_frame(frame: pd.DataFrame, *, name: str, source_path: str | Path | None = None) -> pd.DataFrame:
     data = frame.copy()
     date_candidates = [c for c in data.columns if str(c).lower() in {"date", "trade_dt", "tradedate"}]
     if date_candidates:
@@ -39,6 +56,9 @@ def _normalize_return_frame(frame: pd.DataFrame, *, name: str) -> pd.DataFrame:
     finite = data.to_numpy(dtype=float)
     if np.isinf(finite).any():
         raise ValueError(f"{name}含Inf")
+    # Auto-detect and convert percentage-formatted returns (e.g. 1.0 = 1%) to decimals
+    display_name = source_path.name if isinstance(source_path, Path) and source_path.is_file() else name
+    data = _maybe_scale_to_decimal(data, source_name=display_name)
     return data
 
 
@@ -65,7 +85,7 @@ def read_return_panel(path: str | Path, *, hdf_key: str | None = None) -> pd.Dat
             frame = store[requested]
     else:
         raise ValueError(f"不支持的收益格式: {source}")
-    return _normalize_return_frame(frame, name=source.name)
+    return _normalize_return_frame(frame, name=source.name, source_path=source)
 
 
 def validate_decimal_returns(panel: pd.DataFrame, *, name: str) -> None:

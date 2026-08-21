@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="提取沪深300历史权重和指数收盘价")
     parser.add_argument("--index-code", default="000300.SH")
     parser.add_argument("--start-date", default="20050101")
-    parser.add_argument("--end-date", default="20261231")
+    parser.add_argument("--end-date", default="20260820")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--batch-size", type=int, default=50_000)
     return parser.parse_args()
@@ -107,7 +107,7 @@ def export(args: argparse.Namespace) -> dict[str, object]:
             cursor,
             """
             SELECT S_INFO_WINDCODE, S_CON_WINDCODE, TRADE_DT, I_WEIGHT
-            FROM WIND.AINDEXHS00WEIGHT
+            FROM WIND.AINDEXHS300WEIGHT
             WHERE S_INFO_WINDCODE = :index_code
               AND TRADE_DT >= :start_date AND TRADE_DT <= :end_date
             ORDER BY TRADE_DT, S_CON_WINDCODE
@@ -121,7 +121,7 @@ def export(args: argparse.Namespace) -> dict[str, object]:
             args.batch_size,
         )
         if weights.empty:
-            raise ValueError("AINDEXHS00WEIGHT未返回任何历史权重")
+            raise ValueError("AINDEXHS300WEIGHT未返回任何历史权重")
         _atomic_parquet(weights, weights_path)
 
         try:

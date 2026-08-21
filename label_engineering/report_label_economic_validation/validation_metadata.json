@@ -1,0 +1,140 @@
+{
+  "created_at": "2026-08-21T09:43:31",
+  "validation_years": [
+    2024
+  ],
+  "point_in_time_rules": {
+    "universe": "latest CSI300 weight snapshot on or before prior calendar year end, frozen for validation year",
+    "actual_consensus": "report available_date strictly before actual_known_date",
+    "actual_scale": "per-event floor from only the latest peer forecasts known before actual disclosure",
+    "report_history_coverage": {
+      "start": "2010-01-01",
+      "end": "2025-08-31",
+      "required_through_actual_known_date": true
+    },
+    "return": "close(t) to close(t+1); event returns begin at event date close",
+    "same_day_forecasts_excluded": true
+  },
+  "index_return_source": "wind_index_close",
+  "return_consistency": {
+    "raw_20d": {
+      "n_compared": 14956805,
+      "fraction_close": 1.0,
+      "median_abs_error": 7.760272602297391e-08,
+      "p99_abs_error": 3.3339545309374323e-07,
+      "max_abs_error": 2.9644748664736653e-06
+    },
+    "specific_10d": {
+      "n_compared": 14463249,
+      "fraction_close": 1.0,
+      "median_abs_error": 1.6653345369377348e-16,
+      "p99_abs_error": 8.448103328007051e-16,
+      "max_abs_error": 2.1316282072803006e-14
+    }
+  },
+  "runtime": {
+    "configured_threads": 8,
+    "effective_threads": 8,
+    "shared_server": true,
+    "affinity_threads": 32,
+    "scheduler_threads": null,
+    "cgroup_threads": null,
+    "blas_threads": 1,
+    "nice_increment": 5,
+    "nice_applied": true,
+    "peak_rss_mb": 4557.35546875,
+    "seconds": 50.12095582485199
+  },
+  "sources": [
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/configs/report_label_economic_validation.yaml",
+      "size_bytes": 1781,
+      "mtime_ns": 1787276556280332360,
+      "blake3": "da66ddb2b0413267c7a573ed1893280f62689323237fc829b79046db95c41d65"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/NLP/market/ashare_np_annual_first_20050101_20260801.parquet",
+      "size_bytes": 4055695,
+      "mtime_ns": 1787207664581196673,
+      "blake3": "cfe395093279fd1107876504f97cdd4a8247c4b32a83111831e3b8a513597bf6"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/RTN_daily/trade_days.csv",
+      "size_bytes": 59654,
+      "mtime_ns": 1787186754315417245,
+      "blake3": "d61ab0867a8f2149e3f36225fa26b01078bdba097fa85af497d2482943a9114a"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/RTN_daily/rtn_1d.parquet",
+      "size_bytes": 79208629,
+      "mtime_ns": 1768818854293910331,
+      "blake3": "b12b02b8b2c330dbbf4ceb7776142c3c5771bce2e173bfa8e17e7adbdafff60a"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/RTN_daily/rtn_20d.parquet",
+      "size_bytes": 83486998,
+      "mtime_ns": 1768818858068910291,
+      "blake3": "658eb6f2fe75da6e00df28a296a330ad1874353c3b8861fc89508dd77f9a8c84"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/target/target_close_spret.h5",
+      "size_bytes": 52937656,
+      "mtime_ns": 1768402138932306066,
+      "blake3": "2defaaf7f0a79d737322b6c372a4a4ebe2550aa0db1042d2b59eedf4f9ca8339"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/target/target_close_spret_fut10.parquet",
+      "size_bytes": 141157887,
+      "mtime_ns": 1769097236137973811,
+      "blake3": "6db25c3c1c6b7bc42914a70fa00d899eb293dfb98b4c30cd3887a831de4dcef9"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/NLP/market/csi300_weights_20050101_20260820.parquet",
+      "size_bytes": 2350157,
+      "mtime_ns": 1787273797627361459,
+      "blake3": "3f98efca00a968c28d165ee788a34de2b8aa0c1f53065f1ddd5b241cf18dc5f4"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/report_fy_labels.parquet",
+      "size_bytes": 17608895,
+      "mtime_ns": 1787209350787178886,
+      "blake3": "58de90ec06cb65d5ac60ebd5d02a1c19a7f2f0ea34b94743f5a4f3569663f739"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/report_confirmation_labels.parquet",
+      "size_bytes": 38585540,
+      "mtime_ns": 1787209351756178875,
+      "blake3": "cfb22ea401a36ddb1b7ceb4c88edcd801752dbabb3667cb48d0a04bfcf012466"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/label_metadata.json",
+      "size_bytes": 4638,
+      "mtime_ns": 1787209351780178875,
+      "blake3": "6bc3adf8b99ff5edc88e0459fb245dbbd8ea36d681e6fbde41df869de66c91c2"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_label_cache/e8f8e0b2faa68a0c510656a5/year=2024/report_fy.parquet",
+      "size_bytes": 9397490,
+      "mtime_ns": 1787208602032186784,
+      "blake3": "d25e46713212f81b4498bba84d01c87362bd142c8325c0b5aa1d81d1cc95a2c0"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_label_cache/e8f8e0b2faa68a0c510656a5/year=2025/report_fy.parquet",
+      "size_bytes": 5008120,
+      "mtime_ns": 1787208604181186761,
+      "blake3": "91231eab4abc2702d6ddf629d18ef36013b9bc3609fd893e6489cf974ef2a165"
+    },
+    {
+      "path": "/home/intern_fjq_2026/data/NLP/market/csi300_index_prices_20050101_20260820.parquet",
+      "size_bytes": 58489,
+      "mtime_ns": 1787273797673361459,
+      "blake3": "836d891fa1be2382ed72cfb51401635d44570b996c4e61c3a027758246d266bc"
+    }
+  ],
+  "counts": {
+    "locked_universe_rows": 300,
+    "actual_samples": 299,
+    "analyst_samples": 49779,
+    "consensus_samples": 248910
+  }
+}

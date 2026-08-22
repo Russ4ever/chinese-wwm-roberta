@@ -48,23 +48,18 @@ def test_text_loading_layer_stack_and_strict_inference_state(tmp_path: Path):
             "date": ["2021-01-01", "2021-01-02"],
         }
     )
-    labels = pd.DataFrame({"id": ["a", "b"], "label": [0, 1]})
     text_path = tmp_path / "texts.parquet"
-    label_path = tmp_path / "labels.parquet"
     texts.to_parquet(text_path, index=False)
-    labels.to_parquet(label_path, index=False)
     loaded = load_text_dataset(
         text_path,
         id_column="id",
         text_column="body",
         symbol_column="stock",
         date_column="date",
-        sentiment_label_column="label",
-        sentiment_labels_path=label_path,
-        sentiment_label_id_column="id",
     )
     assert loaded["symbol"].tolist() == ["000001", "600000"]
-    assert loaded["sentiment_label"].tolist() == [0, 1]
+    assert "sentiment_label" not in loaded
+    assert loaded["report_id"].tolist() == ["a", "b"]
     assert loaded["representation_row"].tolist() == [0, 1]
 
     hidden = [torch.full((2, 3, 4), float(layer)) for layer in range(13)]
@@ -134,10 +129,11 @@ def test_representation_extraction_uses_one_forward_for_all_layers(tmp_path: Pat
     texts = pd.DataFrame(
         {
             "representation_row": [0, 1, 2],
-            "text_id": ["a", "b", "c"],
+            "report_id": ["a", "b", "c"],
             "text": ["甲", "乙乙", "丙丙丙"],
             "symbol": ["000001", "000002", "000003"],
-            "trading_date": pd.to_datetime(["2021-01-01", "2021-01-02", "2021-01-03"]),
+            "feature_available_date": pd.to_datetime(["2021-01-01", "2021-01-02", "2021-01-03"]),
+            "text_sha256": ["a", "b", "c"],
         }
     )
     model = ToyCandidate()
@@ -154,14 +150,12 @@ def test_representation_extraction_uses_one_forward_for_all_layers(tmp_path: Pat
     )
     assert model.forward_calls == 2  # 两个batch；不是13层各跑一次。
     check = validate_representation_artifacts(artifacts.directory)
-    assert check == {
-        "rows": 3,
-        "layers": 13,
-        "hidden_size": 4,
-        "dtype": "float32",
-        "metadata_rows": 3,
-        "head_rows": 3,
-    }
+    assert check["rows"] == 3
+    assert check["layers"] == 13
+    assert check["hidden_size"] == 4
+    assert check["dtype"] == "float32"
+    assert check["fixed_head_rows"] == 39
+    assert check["head_recipe"] == "cls_fc"
 
 
 def test_purged_split_drops_future_window_crossing_boundary():
@@ -306,7 +300,7 @@ def _return_probe_data(seed: int = 11):
                 for row in rows
             ],
             "n_texts": 1,
-            "final_sentiment_logit": rng.normal(size=n),
+            "fixed_head_margin": rng.normal(size=n),
             "target_return_rank_5d": target,
             "industry_adjusted_return_fut5d": target / 100,
             "industry": [row[1] % 2 for row in rows],

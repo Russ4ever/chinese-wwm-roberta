@@ -48,7 +48,11 @@ DEFAULT_TRADING_CALENDAR = os.environ.get(
 def parse_args():
     ap = argparse.ArgumentParser(description="social_text 批量推理(预缓存版)")
     ap.add_argument("--month", required=True, help="月份, 如 202403")
-    ap.add_argument("--gpus", default="all", help="0 | 1 | 0,1 | all | cpu")
+    ap.add_argument(
+        "--gpus",
+        default=os.environ.get("SOCIAL_TEXT_GPUS", "1"),
+        help="0 | 1 | 0,1 | all | cpu（默认仅GPU 1；GPU 0须先确认空闲）",
+    )
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--max-length", type=int, default=128)
     ap.add_argument("--pooling", default="cls", choices=["cls", "pooler", "masked_mean"])

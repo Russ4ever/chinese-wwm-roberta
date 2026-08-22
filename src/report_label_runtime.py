@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-SHARED_SERVER_THREAD_CAP = 8
+SHARED_SERVER_THREAD_CAP = 32
 _NICE_APPLIED = False
 _THREADPOOL_GUARD: object | None = None
 

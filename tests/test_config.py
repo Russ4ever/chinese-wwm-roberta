@@ -22,3 +22,11 @@ def test_load_yaml_config_rejects_non_mapping(tmp_path: Path):
     with pytest.raises(TypeError, match="顶层必须是映射"):
         load_yaml_config(path)
 
+
+def test_shared_server_thread_budget_is_conservative_and_overridable(monkeypatch):
+    config_path = Path(__file__).parents[1] / "configs" / "report_labels.yaml"
+    monkeypatch.delenv("SHARED_SERVER_MAX_THREADS", raising=False)
+    assert load_yaml_config(config_path)["performance"]["max_threads"] == "8"
+
+    monkeypatch.setenv("SHARED_SERVER_MAX_THREADS", "16")
+    assert load_yaml_config(config_path)["performance"]["max_threads"] == "16"

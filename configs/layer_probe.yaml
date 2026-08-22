@@ -1,32 +1,51 @@
-# 六阶段逐层 Probe 管线。所有路径支持环境变量覆盖。
-# 默认不打开最终测试集；日期边界和标签映射必须由研究者显式确认。
+# 连续Label主线 Layer Probe。旧 artifacts/layer_probe 不读取、不覆盖。
+
+experiment:
+  name: continuous_label_layer_probe
+  run_id: ${LAYER_PROBE_RUN_ID:-main_v2}
 
 text:
-  path: ${LAYER_PROBE_TEXT_PATH:-artifacts/probe_dataset/probe_texts.parquet}
+  # 全量、与Label有效性筛选解耦的研报表。
+  path: ${LAYER_PROBE_TEXT_PATH:-artifacts/report_labels/reports.parquet}
   id_column: ${LAYER_PROBE_TEXT_ID_COLUMN:-report_id}
   text_column: ${LAYER_PROBE_TEXT_COLUMN:-text}
   symbol_column: ${LAYER_PROBE_SYMBOL_COLUMN:-stock_code}
-  date_column: ${LAYER_PROBE_DATE_COLUMN:-feature_available_date}
-  # 可为空；若标签已在文本表中，只配置 sentiment_label_column 即可。
-  sentiment_labels_path: ${LAYER_PROBE_SENTIMENT_LABEL_PATH:-}
-  sentiment_label_id_column: ${LAYER_PROBE_SENTIMENT_ID_COLUMN:-report_id}
-  sentiment_label_column: ${LAYER_PROBE_SENTIMENT_COLUMN:-sentiment_label}
+  date_column: ${LAYER_PROBE_DATE_COLUMN:-available_date}
   limit: null
 
 model:
   checkpoint: ${CKPT_PATH:-chinese-wwm-roberta.ckpt}
   base_model_dir: ${BASE_MODEL_DIR:-chinese-roberta-wwm-ext}
-  device: ${LAYER_PROBE_DEVICE:-cuda}
+  # 物理GPU 1默认对应cuda:1；CUDA_VISIBLE_DEVICES=1时必须覆盖为cuda:0。
+  device: ${LAYER_PROBE_DEVICE:-cuda:1}
   compute_dtype: float16
   storage_dtype: float16
   batch_size: 128
+  batch_size_candidates: [64, 128, 256, 512]
   max_length: 512
-  # 当前项目只能确认checkpoint里存在fc头；pooling/标签语义确认前不可下最终结论。
-  head_pooling: cls
-  head_pooling_confirmed: false
+  head_recipe: cls_fc
+  head_provenance: user_locked_assumption
+  layer12_rtol: null
+  layer12_atol: null
 
-time_splits:
-  # 必须按真实数据覆盖填写；三个窗口之间的空档就是额外隔离区。
+continuous_targets:
+  bundle_directory: ${LAYER_PROBE_TARGET_BUNDLE:-artifacts/probe_dataset}
+
+fixed_head_analysis:
+  enabled: true
+  saturation_thresholds: [0.90, 0.95, 0.99]
+
+fixed_head_label_analysis:
+  enabled: true
+  quantiles: 5
+
+continuous_probe:
+  enabled: true
+  alpha_grid: [0.1, 1.0, 10.0, 100.0, 1000.0]
+  selection_metric: validation_spearman
+
+# 收益任务按股票日特征时间切分；连续Label使用probe bundle自身的PIT切分。
+return_time_splits:
   train:
     start: ${LAYER_PROBE_TRAIN_START:-}
     end: ${LAYER_PROBE_TRAIN_END:-}
@@ -37,19 +56,11 @@ time_splits:
     start: ${LAYER_PROBE_TEST_START:-}
     end: ${LAYER_PROBE_TEST_END:-}
 
-sentiment_probe:
-  c_grid: [0.01, 0.1, 1.0, 10.0]
-  positive_class_index: 1
-  label_mapping_confirmed: false
-  open_final_test: false
-
 returns:
-  # 项目现有specific return日表即行业调整收益；输入单位必须为小数。
   industry_adjusted_daily_path: ${LAYER_PROBE_SPECIFIC_RETURN_DAILY:-/home/intern_fjq_2026/data/target/target_close_spret.h5}
   hdf_key: null
   horizons: [1, 5, 20]
   primary_horizon: 5
-  # 用最长20日Label结束日清除跨越validation/test边界的样本。
   purge_horizon: 20
   storage_dtype: float16
   aggregation_chunk_size: 16384
@@ -64,7 +75,6 @@ return_probe:
   target_column: target_return_rank_5d
   alpha_grid: [0.1, 1.0, 10.0, 100.0, 1000.0]
   min_daily_observations: 20
-  open_final_test: false
 
 cross_layer_factors:
   middle_layers: [4, 5, 6, 7, 8]
@@ -73,13 +83,26 @@ cross_layer_factors:
 
 strict_test:
   quantiles: 5
-  # validation完成后、打开test之前预注册；示例名称见Notebook输出。
   selected_factors: []
   open_final_test: false
 
+sentiment_appendix:
+  enabled: false
+  labels_path: ${LAYER_PROBE_SENTIMENT_LABEL_PATH:-}
+  label_id_column: ${LAYER_PROBE_SENTIMENT_ID_COLUMN:-report_id}
+  label_column: ${LAYER_PROBE_SENTIMENT_COLUMN:-sentiment_label}
+  c_grid: [0.01, 0.1, 1.0, 10.0]
+  positive_class_index: 1
+  label_mapping_confirmed: false
+  open_final_test: false
+
+performance:
+  shared_server: true
+  max_threads: ${SHARED_SERVER_MAX_THREADS:-8}
+  blas_threads: 1
+  minimum_free_disk_gb: 15
+  minimum_free_disk_fraction: 0.20
+
 output:
-  representations: artifacts/layer_probe/representations
-  sentiment_probe: artifacts/layer_probe/sentiment_probe
-  stock_day_panel: artifacts/layer_probe/stock_day_panel
-  return_probe: artifacts/layer_probe/return_probe
-  factor_validation: artifacts/layer_probe/factor_validation
+  representation_store: ${LAYER_PROBE_REPRESENTATION_STORE:-artifacts/continuous_label_layer_probe/representation_store}
+  run_directory: ${LAYER_PROBE_RUN_DIRECTORY:-artifacts/continuous_label_layer_probe/runs/main_v2}

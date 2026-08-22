@@ -64,7 +64,11 @@ def parse_args():
         help="项目已有交易日文件（CSV/Parquet，含 date 列）",
     )
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "artifacts"))
-    ap.add_argument("--gpus", default="0", help="单个 GPU 编号，或 cpu")
+    ap.add_argument(
+        "--gpus",
+        default=os.environ.get("RESEARCH_REPORT_GPU", "1"),
+        help="单个物理GPU编号，或cpu（默认GPU 1）",
+    )
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--max-length", type=int, default=512)
     ap.add_argument("--pooling", default="cls", choices=["cls", "pooler", "masked_mean"])

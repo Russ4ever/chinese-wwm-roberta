@@ -39,7 +39,7 @@ splits:
 
 performance:
   shared_server: true
-  max_threads: 8
+  max_threads: ${SHARED_SERVER_MAX_THREADS:-8}
   nice_increment: 5
   blas_threads: 1
 

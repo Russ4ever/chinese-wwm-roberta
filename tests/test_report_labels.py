@@ -416,7 +416,7 @@ def test_numba_labels_are_deterministic_between_one_and_eight_threads():
     pd.testing.assert_frame_equal(one, many, check_exact=True)
 
 
-def test_shared_server_runtime_never_exceeds_eight_or_scheduler_limit(monkeypatch):
+def test_shared_server_runtime_never_exceeds_machine_or_scheduler_limit(monkeypatch):
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "4")
     resources = resolve_runtime_resources(
         {
@@ -426,7 +426,7 @@ def test_shared_server_runtime_never_exceeds_eight_or_scheduler_limit(monkeypatc
             "blas_threads": 1,
         }
     )
-    assert resources.configured_threads == 8
+    assert resources.configured_threads == 32
     assert 1 <= resources.effective_threads <= 4
 
 

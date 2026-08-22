@@ -127,6 +127,27 @@ class BinaryClassificationCandidate(nn.Module):
         """backbone 恒冻结（无数据阶段不允许更新 backbone 权重）。"""
         self.bert.requires_grad_(False)
 
+    def apply_frozen_head(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """对预先计算的单层 hidden state 复用当前冻结 pooling/fc 路径。
+
+        Layer Probe 主协议把 ``pooling`` 锁定为 ``cls``。保留统一方法是为了让
+        normal forward 与逐层 projection 共享完全相同的实现，并使 Layer 12
+        数值一致性成为真正的代码路径检查。
+        """
+
+        pooled = apply_pooling(
+            self.pooling,
+            hidden_states,
+            attention_mask=attention_mask,
+            pooler=self.bert.pooler,
+        )
+        return pooled, self.fc(pooled)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -141,9 +162,9 @@ class BinaryClassificationCandidate(nn.Module):
             output_hidden_states=output_hidden_states,
         )
         last_hidden = out.last_hidden_state
-        pooled = apply_pooling(self.pooling, last_hidden, attention_mask=attention_mask,
-                               pooler=self.bert.pooler)
-        logits = self.fc(pooled)
+        pooled, logits = self.apply_frozen_head(
+            last_hidden, attention_mask=attention_mask
+        )
         probabilities = torch.softmax(logits, dim=-1)
         return CandidateOutput(
             logits=logits,

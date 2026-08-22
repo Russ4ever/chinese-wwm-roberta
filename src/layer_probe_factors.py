@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 import tempfile
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -20,6 +19,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 
 from .layer_probe_models import daily_rank_ic, summarize_rank_ic
+from .layer_probe_representations import protocol_config_hash, sha256_file
 
 
 LAYER_COLUMNS = [f"layer_{layer}" for layer in range(13)]
@@ -361,6 +361,19 @@ def evaluate_stratified_ic(
         work["size_group"] = _size_group(work)
         group_columns.append("size_group")
     records: list[dict[str, object]] = []
+    for dimension, source in (("industry_group", "industry"), ("size_group", "size")):
+        if dimension not in group_columns:
+            for factor in factors:
+                records.append(
+                    {
+                        "dimension": dimension,
+                        "group": "unavailable",
+                        "factor": factor,
+                        "available": False,
+                        "reason": f"{source}_exposure_missing",
+                        **summarize_rank_ic([]),
+                    }
+                )
     for dimension in group_columns:
         for group_value, selected in work.groupby(dimension, dropna=False):
             for factor in factors:
@@ -375,6 +388,8 @@ def evaluate_stratified_ic(
                         "dimension": dimension,
                         "group": str(group_value),
                         "factor": factor,
+                        "available": True,
+                        "reason": pd.NA,
                         **summarize_rank_ic(daily["ic"]),
                     }
                 )
@@ -411,11 +426,11 @@ def evaluate_incremental_ic(
     *,
     factors: Sequence[str],
     target_column: str,
-    controls: Sequence[str] = ("final_sentiment_logit", "log_n_texts"),
+    controls: Sequence[str] = ("fixed_head_margin", "log_n_texts"),
     min_daily_observations: int = 20,
     hac_lags: int = 4,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """控制最终层情绪和文本数后的日度partial Rank IC。"""
+    """控制最终层固定头方向和文本数后的日度partial Rank IC。"""
 
     work = matrix.copy()
     work["log_n_texts"] = np.log1p(pd.to_numeric(work["n_texts"], errors="coerce"))
@@ -459,8 +474,8 @@ def _atomic_write_factor_outputs(
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
-    backup = output.parent / f".{output.name}.backup-{uuid.uuid4().hex}"
-    moved = False
+    if output.exists():
+        raise FileExistsError(f"因子产物已存在，拒绝覆盖: {output}")
     try:
         for filename, frame in tables.items():
             path = temporary / filename
@@ -479,27 +494,15 @@ def _atomic_write_factor_outputs(
                 ),
                 encoding="utf-8",
             )
-        if output.exists():
-            os.replace(output, backup)
-            moved = True
-        try:
-            os.replace(temporary, output)
-        except BaseException:
-            if moved and backup.exists() and not output.exists():
-                os.replace(backup, output)
-                moved = False
-            raise
-        if moved:
-            shutil.rmtree(backup)
-            moved = False
+        os.replace(temporary, output)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-        if moved and backup.exists() and not output.exists():
-            os.replace(backup, output)
 
 
-def run_factor_validation_stage(config: Mapping[str, object]) -> Path:
+def run_factor_validation_stage(
+    config: Mapping[str, object], evaluation_split: str = "validation"
+) -> Path:
     """执行阶段5/6；默认只看validation，test必须显式解锁且只能写一次。"""
 
     output_cfg = config.get("output", {})
@@ -512,13 +515,16 @@ def run_factor_validation_stage(config: Mapping[str, object]) -> Path:
         for value in (output_cfg, factor_cfg, strict_cfg, returns_cfg, probe_cfg)
     ):
         raise ValueError("因子检验相关配置必须是对象")
-    return_probe_directory = (
-        Path(str(output_cfg.get("return_probe", "artifacts/layer_probe/return_probe")))
-        .expanduser()
-        .resolve()
-    )
-    open_test = bool(strict_cfg.get("open_final_test", False))
-    return_probe_directory = return_probe_directory / (
+    if evaluation_split not in {"validation", "test"}:
+        raise ValueError("evaluation_split必须是validation或test")
+    run_directory = Path(str(output_cfg.get("run_directory", ""))).expanduser().resolve()
+    open_test = evaluation_split == "test"
+    if open_test:
+        if not bool(strict_cfg.get("open_final_test", False)):
+            raise RuntimeError("因子test未通过strict_test授权")
+        if not (run_directory / "FINAL_TEST_OPENED.json").is_file():
+            raise RuntimeError("因子test缺少全局一次性marker")
+    return_probe_directory = run_directory / "return_probe" / (
         "final_test" if open_test else "validation"
     )
     predictions_path = return_probe_directory / "return_oos_predictions.parquet"
@@ -530,19 +536,9 @@ def run_factor_validation_stage(config: Mapping[str, object]) -> Path:
         [pd.read_parquet(predictions_path), pd.read_parquet(reference_path)],
         ignore_index=True,
     )
-    evaluation_split = "test" if open_test else "validation"
-    output = (
-        Path(
-            str(
-                output_cfg.get(
-                    "factor_validation", "artifacts/layer_probe/factor_validation"
-                )
-            )
-        )
-        .expanduser()
-        .resolve()
+    output = run_directory / "factor_validation" / (
+        "final_test" if open_test else "validation"
     )
-    output = output / ("final_test" if open_test else "validation")
     marker_path = output / "FINAL_TEST_OPENED.json"
     if open_test and marker_path.exists():
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -592,6 +588,44 @@ def run_factor_validation_stage(config: Mapping[str, object]) -> Path:
     )
     return_column = f"industry_adjusted_return_fut{primary_horizon}d"
     min_observations = int(probe_cfg.get("min_daily_observations", 20))
+    if output.exists():
+        required = [
+            output / "candidate_factor_matrix.parquet",
+            output / "daily_rank_ic.csv",
+            output / "factor_summary.csv",
+            output / "quantile_monotonicity.csv",
+            output / "stratified_ic.csv",
+            output / "incremental_ic.csv",
+            output / "manifest.json",
+        ]
+        if open_test:
+            required.append(output / "FINAL_TEST_OPENED.json")
+        for path in required:
+            if not path.is_file():
+                raise RuntimeError(f"已存在因子目录缺少文件，拒绝混读: {path}")
+        existing = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+        expected = {
+            "schema_version": "cross_layer_factor_validation_v2.0",
+            "evaluation_split": evaluation_split,
+            "config_sha256": protocol_config_hash(config),
+            "return_probe_manifest_sha256": sha256_file(
+                return_probe_directory / "manifest.json"
+            ),
+            "factors": factors,
+            "target_column": target_column,
+            "return_column": return_column,
+        }
+        mismatches = {
+            key: {"actual": existing.get(key), "expected": value}
+            for key, value in expected.items()
+            if existing.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "已存在因子产物与当前协议不匹配，拒绝覆盖或混读: "
+                + json.dumps(mismatches, ensure_ascii=False, default=str)
+            )
+        return output
     summary, daily = evaluate_factor_ic(
         matrix,
         factors=factors,
@@ -646,9 +680,13 @@ def run_factor_validation_stage(config: Mapping[str, object]) -> Path:
             "incremental_daily_ic.csv": incremental_daily,
         },
         manifest={
-            "schema_version": "cross_layer_factor_validation_v1.0",
+            "schema_version": "cross_layer_factor_validation_v2.0",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "evaluation_split": evaluation_split,
+            "config_sha256": protocol_config_hash(config),
+            "return_probe_manifest_sha256": sha256_file(
+                return_probe_directory / "manifest.json"
+            ),
             "factors": factors,
             "target_column": target_column,
             "return_column": return_column,

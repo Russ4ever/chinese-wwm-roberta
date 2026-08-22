@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import tempfile
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +19,7 @@ from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 from .layer_probe_representations import (
+    protocol_config_hash,
     representation_artifacts,
     validate_representation_artifacts,
 )
@@ -138,7 +138,7 @@ def load_text_representations(
     artifacts = representation_artifacts(directory)
     array = np.load(artifacts.representations, mmap_mode="r")
     metadata = pd.read_parquet(artifacts.metadata)
-    head = pd.read_parquet(artifacts.head_outputs)
+    head = pd.read_parquet(artifacts.fixed_head_outputs)
     manifest = json.loads(artifacts.manifest.read_text(encoding="utf-8"))
     return array, metadata, head, manifest
 
@@ -491,6 +491,7 @@ def fit_return_layer_probes(
     alpha_grid: Sequence[float],
     min_daily_observations: int,
     include_test: bool,
+    selected_alpha_by_layer: Mapping[int, float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """逐层拟合Ridge；validation用train拟合，test用train+validation重拟合。"""
 
@@ -506,8 +507,16 @@ def fit_return_layer_probes(
     missing = sorted(required.difference(panel.columns))
     if missing:
         raise ValueError("股票日panel缺少字段: " + ", ".join(missing))
-    if len(panel) != representations.shape[0]:
-        raise ValueError("股票日representation与panel行数不一致")
+    representation_rows = pd.to_numeric(
+        panel["representation_row"], errors="coerce"
+    )
+    if representation_rows.isna().any():
+        raise ValueError("股票日panel含无效representation_row")
+    integer_rows = representation_rows.to_numpy(dtype=np.int64)
+    if not np.array_equal(representation_rows.to_numpy(dtype=float), integer_rows):
+        raise ValueError("股票日panel的representation_row必须是整数")
+    if (integer_rows < 0).any() or (integer_rows >= representations.shape[0]).any():
+        raise ValueError("股票日panel的representation_row越界")
     alphas = sorted({float(value) for value in alpha_grid})
     if not alphas or min(alphas) < 0:
         raise ValueError("Ridge alpha必须非负")
@@ -539,8 +548,8 @@ def fit_return_layer_probes(
             "trading_date",
             "split",
             "n_texts",
-            "final_sentiment_logit",
-            "final_sentiment_probability",
+            "fixed_head_margin",
+            "fixed_head_class_1_probability",
             "industry",
             "size",
             target_column,
@@ -566,29 +575,48 @@ def fit_return_layer_probes(
         )
         best_alpha: float | None = None
         best_ic = -np.inf
-        for alpha in alphas:
-            candidate = Ridge(alpha=alpha).fit(x_train_scaled, y["train"])
-            validation_prediction = candidate.predict(x_validation)
-            validation_rows = usable[usable["split"].eq("validation")].copy()
-            validation_rows["prediction"] = validation_prediction
-            ic_table = daily_rank_ic(
-                validation_rows,
-                prediction_column="prediction",
-                target_column=target_column,
-                min_observations=min_daily_observations,
-            )
-            score = summarize_rank_ic(ic_table["ic"])["rank_ic"]
+        if selected_alpha_by_layer is not None:
+            if layer not in selected_alpha_by_layer:
+                raise ValueError(f"冻结的收益alpha缺少Layer {layer}")
+            best_alpha = float(selected_alpha_by_layer[layer])
+            if best_alpha not in alphas:
+                raise ValueError(f"冻结的收益alpha不在当前网格: layer={layer}, alpha={best_alpha}")
             tuning.append(
                 {
                     "layer": layer,
-                    "alpha": alpha,
-                    "validation_rank_ic": score,
+                    "alpha": best_alpha,
+                    "validation_rank_ic": np.nan,
+                    "selection_source": "frozen_validation_manifest",
                 }
             )
-            comparable = -np.inf if not np.isfinite(score) else float(score)
-            if comparable > best_ic:
-                best_ic = comparable
-                best_alpha = alpha
+        else:
+            for alpha in alphas:
+                candidate = Ridge(alpha=alpha).fit(x_train_scaled, y["train"])
+                validation_prediction = candidate.predict(x_validation)
+                validation_rows = usable[usable["split"].eq("validation")].copy()
+                validation_rows["prediction"] = validation_prediction
+                ic_table = daily_rank_ic(
+                    validation_rows,
+                    prediction_column="prediction",
+                    target_column=target_column,
+                    min_observations=min_daily_observations,
+                )
+                score = summarize_rank_ic(ic_table["ic"])["rank_ic"]
+                tuning.append(
+                    {
+                        "layer": layer,
+                        "alpha": alpha,
+                        "validation_rank_ic": score,
+                    }
+                )
+                comparable = -np.inf if not np.isfinite(score) else float(score)
+                if (
+                    best_alpha is None
+                    or comparable > best_ic
+                    or (comparable == best_ic and alpha > best_alpha)
+                ):
+                    best_ic = comparable
+                    best_alpha = alpha
         if best_alpha is None:
             raise ValueError(f"Layer {layer}无法在validation计算有效Rank IC")
         validation_model = Ridge(alpha=best_alpha).fit(x_train_scaled, y["train"])
@@ -720,8 +748,8 @@ def _atomic_write_probe_outputs(
         raise ValueError(f"拒绝写入过宽目录: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
-    backup = output.parent / f".{output.name}.backup-{uuid.uuid4().hex}"
-    moved = False
+    if output.exists():
+        raise FileExistsError(f"Probe产物已存在，拒绝覆盖: {output}")
     try:
         for filename, table in tables.items():
             path = temporary / filename
@@ -742,62 +770,60 @@ def _atomic_write_probe_outputs(
                 ),
                 encoding="utf-8",
             )
-        if output.exists():
-            os.replace(output, backup)
-            moved = True
-        try:
-            os.replace(temporary, output)
-        except BaseException:
-            if moved and backup.exists() and not output.exists():
-                os.replace(backup, output)
-                moved = False
-            raise
-        if moved:
-            shutil.rmtree(backup)
-            moved = False
+        os.replace(temporary, output)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-        if moved and backup.exists() and not output.exists():
-            os.replace(backup, output)
     return output
 
 
-def run_sentiment_probe_stage(config: Mapping[str, object]) -> Path:
-    """加载阶段1产物，运行情绪Probe并写出曲线/OOS分布。"""
+def run_optional_sentiment_probe_stage(config: Mapping[str, object]) -> Path:
+    """运行默认关闭、与主流程解耦的二元情绪附录。"""
+
+    from .layer_probe_representations import resolve_representation_directory
 
     output_cfg = config.get("output", {})
-    probe_cfg = config.get("sentiment_probe", {})
-    split_cfg = config.get("time_splits", {})
-    if not all(
-        isinstance(value, Mapping) for value in (output_cfg, probe_cfg, split_cfg)
-    ):
-        raise ValueError("output/sentiment_probe/time_splits配置必须是对象")
+    probe_cfg = config.get("sentiment_appendix", {})
+    split_cfg = config.get("return_time_splits", {})
+    if not all(isinstance(value, Mapping) for value in (output_cfg, probe_cfg, split_cfg)):
+        raise ValueError("output/sentiment_appendix/return_time_splits配置必须是对象")
+    if not bool(probe_cfg.get("enabled", False)):
+        raise RuntimeError("sentiment_appendix.enabled=false，附录未启用")
+    if not bool(probe_cfg.get("label_mapping_confirmed", False)):
+        raise RuntimeError("情绪附录要求先确认0/1类别映射")
+    label_path = Path(str(probe_cfg.get("labels_path", ""))).expanduser().resolve()
+    if not label_path.is_file():
+        raise FileNotFoundError(f"情绪附录标签表不存在: {label_path}")
+    labels = pd.read_parquet(label_path) if label_path.suffix.lower() in {".parquet", ".pq"} else pd.read_csv(label_path)
+    id_column = str(probe_cfg.get("label_id_column", "report_id"))
+    label_column = str(probe_cfg.get("label_column", "sentiment_label"))
+    if id_column not in labels or label_column not in labels:
+        raise ValueError("情绪附录标签表缺少ID或Label字段")
     representations, metadata, head, rep_manifest = load_text_representations(
-        output_cfg.get("representations", "artifacts/layer_probe/representations")
+        resolve_representation_directory(config)
+    )
+    metadata = metadata.merge(
+        labels[[id_column, label_column]].rename(columns={id_column: "report_id", label_column: "sentiment_label"}),
+        on="report_id",
+        how="left",
+        validate="one_to_one",
+    ).rename(columns={"report_id": "text_id", "feature_available_date": "trading_date"})
+    final_head = head[head["layer"].eq(12)].merge(
+        metadata[["representation_row", "text_id"]],
+        on="representation_row",
+        validate="one_to_one",
     )
     include_test = bool(probe_cfg.get("open_final_test", False))
-    sentiment_output = (
-        Path(
-            str(
-                output_cfg.get(
-                    "sentiment_probe", "artifacts/layer_probe/sentiment_probe"
-                )
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
-    sentiment_output = sentiment_output / (
+    run_directory = Path(str(output_cfg.get("run_directory", ""))).expanduser().resolve()
+    sentiment_output = run_directory / "sentiment_appendix" / (
         "final_test" if include_test else "validation"
     )
-    sentiment_marker = sentiment_output / "FINAL_SENTIMENT_TEST_OPENED.json"
-    if sentiment_marker.exists():
-        raise RuntimeError("情绪最终测试已经打开，拒绝覆盖或重复运行")
+    if sentiment_output.exists():
+        raise FileExistsError(f"情绪附录产物已存在，拒绝覆盖: {sentiment_output}")
     metrics, predictions, distributions, audit = fit_sentiment_layer_probes(
         representations,
         metadata,
-        head,
+        final_head,
         split_config=split_cfg,
         c_grid=probe_cfg.get("c_grid", [0.01, 0.1, 1.0, 10.0]),
         positive_class_index=int(probe_cfg.get("positive_class_index", 1)),
@@ -817,7 +843,7 @@ def run_sentiment_probe_stage(config: Mapping[str, object]) -> Path:
             "sentiment_probe_audit.csv": audit,
         },
         manifest={
-            "schema_version": "sentiment_layer_probe_v1.0",
+            "schema_version": "optional_sentiment_appendix_v2.0",
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "representation_manifest": rep_manifest,
             "include_test": include_test,
@@ -827,9 +853,7 @@ def run_sentiment_probe_stage(config: Mapping[str, object]) -> Path:
             ),
             "selection_metric": "validation_auc",
         },
-        final_test_marker_name=(
-            "FINAL_SENTIMENT_TEST_OPENED.json" if include_test else None
-        ),
+        final_test_marker_name=("FINAL_SENTIMENT_TEST_OPENED.json" if include_test else None),
         final_test_marker=(
             {
                 "opened_at": datetime.now().isoformat(timespec="seconds"),
@@ -841,7 +865,50 @@ def run_sentiment_probe_stage(config: Mapping[str, object]) -> Path:
     )
 
 
-def run_return_probe_stage(config: Mapping[str, object]) -> Path:
+def validate_optional_sentiment_outputs(directory: str | Path) -> dict[str, object]:
+    root = Path(directory).expanduser().resolve()
+    required = [
+        root / "sentiment_metrics.csv",
+        root / "sentiment_oos_predictions.parquet",
+        root / "sentiment_logit_distributions.csv",
+        root / "probability_compression_diagnostic.csv",
+        root / "sentiment_probe_audit.csv",
+        root / "manifest.json",
+    ]
+    for path in required:
+        if not path.is_file():
+            raise FileNotFoundError(f"情绪附录产物缺失: {path}")
+    metrics = pd.read_csv(required[0])
+    predictions = pd.read_parquet(required[1])
+    layer_metrics = metrics[metrics["model_kind"].eq("layer_logistic")]
+    for split in layer_metrics["split"].unique():
+        if set(layer_metrics.loc[layer_metrics["split"].eq(split), "layer"]) != set(
+            range(13)
+        ):
+            raise ValueError(f"情绪附录{split}没有完整13层")
+    return {"metric_rows": len(metrics), "prediction_rows": len(predictions)}
+
+
+def plot_optional_sentiment_curve(
+    directory: str | Path, *, split: str = "validation", metric: str = "auc"
+):
+    import matplotlib.pyplot as plt
+
+    data = pd.read_csv(Path(directory) / "sentiment_metrics.csv")
+    data = data[
+        data["model_kind"].eq("layer_logistic") & data["split"].eq(split)
+    ].sort_values("layer")
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(data["layer"], data[metric], marker="o")
+    ax.set(title=f"Optional sentiment appendix ({split})", xlabel="Layer", ylabel=metric)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    return fig
+
+
+def run_return_probe_stage(
+    config: Mapping[str, object], evaluation_split: str = "validation"
+) -> Path:
     """加载股票日representation，执行阶段4 Ridge Probe。"""
 
     from .layer_probe_panel import (
@@ -860,24 +927,27 @@ def run_return_probe_stage(config: Mapping[str, object]) -> Path:
         for value in (output_cfg, probe_cfg, returns_cfg, strict_cfg)
     ):
         raise ValueError("output/return_probe/returns配置必须是对象")
-    stock_day_directory = (
-        Path(
-            str(
-                output_cfg.get(
-                    "stock_day_panel", "artifacts/layer_probe/stock_day_panel"
-                )
-            )
-        )
-        .expanduser()
-        .resolve()
+    if evaluation_split not in {"validation", "test"}:
+        raise ValueError("evaluation_split必须是validation或test")
+    run_directory = Path(str(output_cfg.get("run_directory", ""))).expanduser().resolve()
+    stock_day_directory = run_directory / "stock_day_panel"
+    validate_stock_day_artifacts(
+        stock_day_directory, evaluation_split=evaluation_split
     )
-    validate_stock_day_artifacts(stock_day_directory)
     representations = np.load(
         stock_day_directory / STOCK_DAY_REPRESENTATION_FILE, mmap_mode="r"
     )
-    panel = pd.read_parquet(stock_day_directory / STOCK_DAY_PANEL_FILE)
-    panel_manifest = json.loads(
+    stock_day_evaluation_directory = stock_day_directory / (
+        "final_test" if evaluation_split == "test" else "validation"
+    )
+    panel = pd.read_parquet(stock_day_evaluation_directory / STOCK_DAY_PANEL_FILE)
+    canonical_manifest = json.loads(
         (stock_day_directory / STOCK_DAY_MANIFEST_FILE).read_text(encoding="utf-8")
+    )
+    evaluation_manifest = json.loads(
+        (stock_day_evaluation_directory / STOCK_DAY_MANIFEST_FILE).read_text(
+            encoding="utf-8"
+        )
     )
     target_column = str(
         probe_cfg.get(
@@ -885,21 +955,83 @@ def run_return_probe_stage(config: Mapping[str, object]) -> Path:
             f"target_return_rank_{int(returns_cfg.get('primary_horizon', 5))}d",
         )
     )
-    include_test = bool(probe_cfg.get("open_final_test", False))
-    return_output = (
-        Path(str(output_cfg.get("return_probe", "artifacts/layer_probe/return_probe")))
-        .expanduser()
-        .resolve()
+    include_test = evaluation_split == "test"
+    if include_test:
+        if not bool(strict_cfg.get("open_final_test", False)):
+            raise RuntimeError("收益test未通过strict_test授权")
+        if not (run_directory / "FINAL_TEST_OPENED.json").is_file():
+            raise RuntimeError("收益test缺少全局一次性marker")
+    return_output = run_directory / "return_probe" / (
+        "final_test" if include_test else "validation"
     )
-    return_output = return_output / ("final_test" if include_test else "validation")
-    return_marker = return_output / "FINAL_RETURN_TEST_OPENED.json"
-    if return_marker.exists():
-        raise RuntimeError("收益最终测试已经打开，拒绝覆盖或重复运行")
     selected_factors = [str(value) for value in strict_cfg.get("selected_factors", [])]
     if include_test and not selected_factors:
         raise ValueError(
             "打开收益最终测试前必须在strict_test.selected_factors预注册因子"
         )
+    frozen_alpha = None
+    validation_manifest_sha = None
+    if include_test:
+        validation_directory = run_directory / "return_probe" / "validation"
+        validation_metrics_path = validation_directory / "return_probe_metrics.csv"
+        validation_manifest_path = validation_directory / "manifest.json"
+        if not validation_metrics_path.is_file() or not validation_manifest_path.is_file():
+            raise FileNotFoundError("收益test缺少已冻结的validation结果")
+        validation_metrics = pd.read_csv(validation_metrics_path)
+        validation_metrics = validation_metrics[validation_metrics["split"].eq("validation")]
+        frozen_alpha = {
+            int(row.layer): float(row.selected_alpha)
+            for row in validation_metrics.itertuples()
+        }
+        from .layer_probe_representations import sha256_file
+
+        validation_manifest_sha = sha256_file(validation_manifest_path)
+    if return_output.exists():
+        manifest_path = return_output / "manifest.json"
+        required = [
+            return_output / "return_probe_metrics.csv",
+            return_output / "return_oos_predictions.parquet",
+            return_output / "return_fit_reference_predictions.parquet",
+            return_output / "return_probe_tuning.csv",
+            manifest_path,
+        ]
+        if include_test:
+            required.append(return_output / "FINAL_RETURN_TEST_OPENED.json")
+        for path in required:
+            if not path.is_file():
+                raise RuntimeError(f"已存在收益Probe目录缺少文件，拒绝混读: {path}")
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected = {
+            "schema_version": "return_layer_probe_v2.0",
+            "config_sha256": protocol_config_hash(config),
+            "target_column": target_column,
+            "include_test": include_test,
+            "validation_manifest_sha256": validation_manifest_sha,
+        }
+        mismatches = {
+            key: {"actual": existing.get(key), "expected": value}
+            for key, value in expected.items()
+            if existing.get(key) != value
+        }
+        if (
+            existing.get("stock_day_evaluation_manifest")
+            != evaluation_manifest
+        ):
+            mismatches["stock_day_evaluation_manifest"] = "changed"
+        if include_test:
+            opened = json.loads(
+                (return_output / "FINAL_RETURN_TEST_OPENED.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if opened.get("selected_factors_preregistered") != selected_factors:
+                mismatches["selected_factors_preregistered"] = "changed"
+        if mismatches:
+            raise RuntimeError(
+                "已存在收益Probe与当前协议不匹配，拒绝覆盖或混读: "
+                + json.dumps(mismatches, ensure_ascii=False, default=str)
+            )
+        return return_output
     metrics, predictions, tuning = fit_return_layer_probes(
         representations,
         panel,
@@ -907,6 +1039,7 @@ def run_return_probe_stage(config: Mapping[str, object]) -> Path:
         alpha_grid=probe_cfg.get("alpha_grid", [0.1, 1.0, 10.0, 100.0]),
         min_daily_observations=int(probe_cfg.get("min_daily_observations", 20)),
         include_test=include_test,
+        selected_alpha_by_layer=frozen_alpha,
     )
     oos_predictions = predictions[predictions["prediction_role"].eq("oos")].copy()
     reference_predictions = predictions[
@@ -921,13 +1054,16 @@ def run_return_probe_stage(config: Mapping[str, object]) -> Path:
             "return_probe_tuning.csv": tuning,
         },
         manifest={
-            "schema_version": "return_layer_probe_v1.0",
+            "schema_version": "return_layer_probe_v2.0",
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "stock_day_manifest": panel_manifest,
+            "config_sha256": protocol_config_hash(config),
+            "stock_day_canonical_manifest": canonical_manifest,
+            "stock_day_evaluation_manifest": evaluation_manifest,
             "target_column": target_column,
             "include_test": include_test,
             "selection_metric": "validation_daily_mean_rank_ic",
             "test_fit": "selected alpha; scaler and Ridge refit on train+validation",
+            "validation_manifest_sha256": validation_manifest_sha,
         },
         final_test_marker_name=(
             "FINAL_RETURN_TEST_OPENED.json" if include_test else None

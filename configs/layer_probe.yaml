@@ -47,14 +47,14 @@ continuous_probe:
 # 收益任务按股票日特征时间切分；连续Label使用probe bundle自身的PIT切分。
 return_time_splits:
   train:
-    start: ${LAYER_PROBE_TRAIN_START:-}
-    end: ${LAYER_PROBE_TRAIN_END:-}
+    start: "2024-01-01"
+    end: "2024-06-30"
   validation:
-    start: ${LAYER_PROBE_VALIDATION_START:-}
-    end: ${LAYER_PROBE_VALIDATION_END:-}
+    start: "2024-07-01"
+    end: "2024-09-30"
   test:
-    start: ${LAYER_PROBE_TEST_START:-}
-    end: ${LAYER_PROBE_TEST_END:-}
+    start: "2024-10-01"
+    end: "2024-12-31"
 
 returns:
   industry_adjusted_daily_path: ${LAYER_PROBE_SPECIFIC_RETURN_DAILY:-/home/intern_fjq_2026/data/target/target_close_spret.h5}

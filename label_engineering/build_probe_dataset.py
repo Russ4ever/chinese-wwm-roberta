@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# coding=utf-8
 """把研报文本与 Residual/Dispersion Label 装配为 Linear Probe bundle。"""
 
 from __future__ import annotations

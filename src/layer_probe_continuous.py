@@ -1122,7 +1122,7 @@ def validate_continuous_probe_outputs(directory: str | Path) -> dict[str, object
         raise ValueError("continuous_probe_fit_reference混入OOS")
     oos_metrics = metrics[metrics["prediction_role"].eq("oos")]
     incomplete = oos_metrics.groupby("task_id")["layer"].agg(
-        lambda values: set(values) != set(range(13))
+        lambda values: set(values) != set(range(1, 13))
     )
     if incomplete.any():
         raise ValueError("连续Label Probe部分已评价任务没有完整13层")

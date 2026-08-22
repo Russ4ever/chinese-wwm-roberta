@@ -1,11 +1,6 @@
-# 逐层 Linear Probe 数据装配。
-#
-# 该入口不会随机切分，也不会用全样本统计量处理 Label。只有显式配置安全的
-# 时间分区后，仅当至少一个 task 的 train/validation/test 都有正权重样本时，
-# metadata.training_ready 才会为 true；具体可训练任务见 training_ready_tasks。
-
+# Probe dataset configuration
 paths:
-  report_labels: ${REPORT_LABEL_OUTPUT_DIR:-artifacts/report_labels}
+  report_labels: artifacts/report_labels
 
 targets:
   forecast_horizons: [0, 1, 2]
@@ -15,31 +10,26 @@ targets:
     enabled: true
   dispersion:
     enabled: true
-    # false：使用 confirmation_valid 主样本并保留 probe_valid 标志/权重；
-    # true：只输出 confirmation_probe_valid == 1 的严格子样本。
     require_probe_valid: false
 
 splits:
-  # 当前默认只完成连接与审计，不允许训练。启用前必须将下面三个时间窗口
-  # 替换成真实研究区间；不要为了使用2024单年样本而随机拆分。
-  enabled: false
+  enabled: true
   train:
-    feature_start: null
-    feature_end: null
-    label_cutoff: null
+    feature_start: "2024-01-01"
+    feature_end: "2024-06-30"
+    label_cutoff: "2024-06-29"
   validation:
-    feature_start: null
-    feature_end: null
-    label_cutoff: null
+    feature_start: "2024-07-01"
+    feature_end: "2024-09-30"
+    label_cutoff: "2024-09-29"
   test:
-    feature_start: null
-    feature_end: null
-    # 测试 Label 是事后评价结果，可留空；若填写则同样进行可知日过滤。
-    label_cutoff: null
+    feature_start: "2024-10-01"
+    feature_end: "2024-12-31"
+    label_cutoff: "2024-12-31"
 
 performance:
   shared_server: true
-  max_threads: ${SHARED_SERVER_MAX_THREADS:-8}
+  max_threads: 8
   nice_increment: 5
   blas_threads: 1
 

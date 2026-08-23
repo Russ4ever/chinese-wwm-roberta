@@ -1,0 +1,828 @@
+[
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_active_peers",
+    "count": 346370
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 148928
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 9181
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh0",
+    "scope": "main_validity",
+    "reason": "crosses_actual_disclosure",
+    "count": 12
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_active_peers",
+    "count": 329327
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh1",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 132901
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh1",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 9126
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_active_peers",
+    "count": 234614
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh2",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 60415
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__active__fh2",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 8237
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 301429
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 9181
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "crosses_actual_disclosure",
+    "count": 12
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh0",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 149142
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 279550
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 9126
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh1",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 142782
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh2",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 154823
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh2",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 8237
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__fixed__fh2",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 111450
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 299275
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 9181
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_future_peers",
+    "count": 8381
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "main_validity",
+    "reason": "crosses_actual_disclosure",
+    "count": 12
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh0",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 143677
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 277552
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 9126
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_future_peers",
+    "count": 7631
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh1",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 137844
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh2",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 154112
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh2",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 8237
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_future_peers",
+    "count": 2670
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__1m__market__fh2",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 109704
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 225777
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_active_peers",
+    "count": 152538
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 13706
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "crosses_actual_disclosure",
+    "count": 4481
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh1",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 217781
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_active_peers",
+    "count": 118075
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh1",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 13486
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh2",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 110629
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_active_peers",
+    "count": 95014
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__active__fh2",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 11646
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 297695
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 13706
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "crosses_actual_disclosure",
+    "count": 4481
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh0",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 59035
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 277852
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 13486
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh1",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 41952
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh2",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 153585
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh2",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 11646
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__fixed__fh2",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 37054
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 292265
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_future_peers",
+    "count": 20012
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 13706
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "crosses_actual_disclosure",
+    "count": 4481
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh0",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 48478
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 273663
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_future_peers",
+    "count": 15665
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 13486
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh1",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 34044
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh2",
+    "scope": "main_validity",
+    "reason": "report_inline_with_consensus",
+    "count": 151297
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh2",
+    "scope": "main_validity",
+    "reason": "right_censored",
+    "count": 11646
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_future_peers",
+    "count": 8322
+  },
+  {
+    "label_name": "delta_log_dispersion",
+    "task_id": "delta_log_dispersion__3m__market__fh2",
+    "scope": "probe_validity",
+    "reason": "insufficient_peer_updates",
+    "count": 32985
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 215174
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh0",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 4025
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh0",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 2573
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh0",
+    "scope": "main_validity",
+    "reason": "actual_missing",
+    "count": 689
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 144385
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh1",
+    "scope": "main_validity",
+    "reason": "actual_missing",
+    "count": 42702
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh1",
+    "scope": "main_validity",
+    "reason": "insufficient_scale_history",
+    "count": 2830
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh1",
+    "scope": "main_validity",
+    "reason": "conflicting_report_forecast",
+    "count": 268
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh2",
+    "scope": "main_validity",
+    "reason": "insufficient_pre_peers",
+    "count": 164343
+  },
+  {
+    "label_name": "residual_signed_raw",
+    "task_id": "residual_signed_raw__fh2",
+    "scope": "main_validity",
+    "reason": "actual_missing",
+    "count": 81150
+  }
+]

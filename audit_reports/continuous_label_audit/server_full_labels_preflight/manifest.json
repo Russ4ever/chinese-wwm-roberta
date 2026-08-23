@@ -1,0 +1,167 @@
+{
+  "schema_version": "continuous_label_coverage_audit_v1.0",
+  "created_at": "2026-08-23T12:35:16",
+  "outcome_blind": true,
+  "label_value_columns_loaded": [],
+  "repository_root": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta",
+  "output_directory": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/audit_reports/continuous_label_audit/server_full_labels_preflight",
+  "maturity_months": [
+    1,
+    3,
+    6,
+    9,
+    12,
+    18,
+    24,
+    30,
+    36,
+    42,
+    48
+  ],
+  "target_settings": {
+    "forecast_horizons": [
+      0,
+      1,
+      2
+    ],
+    "confirmation_months": [
+      1,
+      3
+    ],
+    "peer_panels": [
+      "fixed",
+      "market",
+      "active"
+    ],
+    "residual_enabled": true,
+    "dispersion_enabled": true,
+    "dispersion_require_probe_valid": false
+  },
+  "source_counts": {
+    "reports": 1070181,
+    "report_fy_labels": 2625006,
+    "report_confirmation_labels": 15750036
+  },
+  "source_integrity": {
+    "reports_duplicate_report_id_rows": 0,
+    "residual_duplicate_key_rows": 0,
+    "dispersion_duplicate_key_rows": 0,
+    "residual_label_versions": [
+      "report_future_v1.0"
+    ],
+    "dispersion_label_versions": [
+      "report_future_v1.0"
+    ],
+    "metadata_label_version": "report_future_v1.0",
+    "label_version_consistent": true
+  },
+  "upstream_label_metadata": {
+    "label_version": "report_future_v1.0",
+    "created_at": "2026-08-23T12:29:30",
+    "counts": {
+      "source_rows": 3612132,
+      "canonical_report_fy_rows_read": 2625006,
+      "reports_output": 1070181,
+      "report_fy_rows_output": 2625006,
+      "confirmation_rows_output": 15750036,
+      "residual_valid": 1966867,
+      "edge_valid": 1966867,
+      "confirmation_valid": 7190675,
+      "confirmation_probe_valid": 6142528
+    }
+  },
+  "sources": [
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/configs/probe_dataset.yaml",
+      "size_bytes": 753,
+      "mtime_ns": 1787390938817306183,
+      "sha256": "ade82b3568304816091907566c58ff8de0d2795fac52e3061b8110d9e4002fc8"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/reports.parquet",
+      "size_bytes": 1624308981,
+      "mtime_ns": 1787459355171102886,
+      "sha256": "f143f1070d1e83a5958f43c1b4b28f9f8ffed0688f47d804fb6979aa879220be"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/report_fy_labels.parquet",
+      "size_bytes": 192213191,
+      "mtime_ns": 1787459360150102834,
+      "sha256": "2a8e3e7d8e3de0e4d4f1ed255aa9892d4ee76b510f0fc5187a63482c087a938e"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/report_confirmation_labels.parquet",
+      "size_bytes": 376208449,
+      "mtime_ns": 1787459370506102724,
+      "sha256": "8c57ca73c12d9ee7e39b141c12601f82b489a7fc86908e22882f66caf5e54415"
+    },
+    {
+      "path": "/home/intern_fjq_2026/Projects/chinese-wwm-roberta/artifacts/report_labels/label_metadata.json",
+      "size_bytes": 4651,
+      "mtime_ns": 1787459370807102721,
+      "sha256": "99e9284a62bffa1082865dc30c16a6540c9f17aa4b25df43b61a9321be7572a2"
+    }
+  ],
+  "tables": {
+    "task_coverage": {
+      "file": "task_coverage.json",
+      "rows": 21
+    },
+    "maturity_distribution": {
+      "file": "maturity_distribution.json",
+      "rows": 21
+    },
+    "invalid_reason_counts": {
+      "file": "invalid_reason_counts.json",
+      "rows": 118
+    },
+    "configured_split_counts": {
+      "file": "configured_split_counts.json",
+      "rows": 63
+    },
+    "candidate_window_counts": {
+      "file": "candidate_window_counts.json",
+      "rows": 8118
+    }
+  },
+  "generated_files": [
+    {
+      "file": "task_coverage.json",
+      "size_bytes": 15490,
+      "sha256": "fb728eb05f4b21144d245ece646631d6b659cffec4de273e69327a8870ada384"
+    },
+    {
+      "file": "maturity_distribution.json",
+      "size_bytes": 5503,
+      "sha256": "c98b24a6600aff41fcfb5fa4754e675996c194325bf1c075ada37fd265de76bd"
+    },
+    {
+      "file": "invalid_reason_counts.json",
+      "size_bytes": 23111,
+      "sha256": "32a6045ee05f81442ad0646d1b40045bcd0fb81fa5a54496c50f5a06d0a44a9f"
+    },
+    {
+      "file": "configured_split_counts.json",
+      "size_bytes": 34783,
+      "sha256": "4422898a69ec014f331eb2cc7183efaeaa8f81ed493bc40ed06a89c2e0cd849d"
+    },
+    {
+      "file": "candidate_window_counts.json",
+      "size_bytes": 3915517,
+      "sha256": "57a333c69c7c556d69f9c394ba891a12f8543bec08c5511fca97ff43f6d383ab"
+    },
+    {
+      "file": "SUMMARY.md",
+      "size_bytes": 19158,
+      "sha256": "527ac34f76d45c3743b9a5879c36378558668069c4d917ce628ea99f34269b48"
+    }
+  ],
+  "write_contract": {
+    "overwrite": false,
+    "extensions": [
+      ".json",
+      ".md"
+    ],
+    "default_root": "audit_reports/continuous_label_audit"
+  }
+}

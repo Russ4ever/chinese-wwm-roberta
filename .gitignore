@@ -56,6 +56,12 @@ flax_model.msgpack
 /mlruns/
 *.log
 
+# 小型聚合审计报告需要在服务器与本机之间通过Git同步；仅允许JSON/Markdown。
+!/audit_reports/
+!/audit_reports/**/
+!/audit_reports/**/*.json
+!/audit_reports/**/*.md
+
 # Python 缓存、构建与虚拟环境
 __pycache__/
 *.py[cod]

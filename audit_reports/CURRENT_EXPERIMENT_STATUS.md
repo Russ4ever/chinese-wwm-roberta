@@ -94,6 +94,24 @@ state that has only been reported through the running notebook.
   representation/fixed-head/target artifacts, while the Ridge output records a
   separate numerical-policy fingerprint.  This revision has passed local tests
   but has not yet been confirmed on the remote real-data run.
+- The completed remote static notebook was subsequently synchronized to this
+  checkout and locally inspected.  It has execution counts 1 through 11, no
+  error output, and final status `completed`.  Section 5 reports 939,831 OOS
+  report-level Ridge predictions for six tasks across Layers 1 through 12;
+  Section 6 reports 137,441 CSI300 `symbol x trading_date` factor rows, 144
+  Rank-IC summary rows, and 936 layer-correlation rows.  The generated remote
+  manifests and full CSV/Parquet tables have not yet been synchronized, so the
+  notebook verifies stage completion and headline counts but not all row-level
+  values or artifact hashes.
+- A separate opened-test exploration notebook now exists at
+  `notebooks/layer_probe_residual_dense_test_pipeline.ipynb`.  It does not
+  refit Ridge or change the static protocol.  It reads the existing residual
+  FY0 stock-day predictions, carries Layers 3/6/9/11/12 under eight explicitly
+  exploratory event/5-day/20-day/60-day/until-next-report rules, activates
+  tradable signals on the next trading session, and writes only under
+  `dense_residual_test_exploration_v1` inside the static run directory.  Local
+  notebook structure and synthetic no-look-ahead tests pass, but no real-data
+  remote execution of this densification notebook has yet been confirmed.
 
 ## Confirmed label state
 

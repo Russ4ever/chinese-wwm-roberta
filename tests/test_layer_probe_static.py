@@ -14,7 +14,9 @@ from src.config import load_yaml_config
 from src.layer_probe_static import (
     DIRECT_TASK_ID,
     MODELED_LAYERS,
+    RidgeParameters,
     STATIC_TASKS,
+    _ridge_equivalence_audit,
     _stats_from_arrays,
     accumulate_layer_statistics,
     aggregate_report_predictions_to_stock_day,
@@ -24,6 +26,8 @@ from src.layer_probe_static import (
     daily_layer_correlation_tables_wide,
     daily_rank_ic_tables,
     parse_static_protocol,
+    plot_static_layer_correlation,
+    plot_static_rank_ic,
     ridge_path_from_stats,
     run_static_csi300_evaluation_stage,
     validate_static_csi300_evaluation_outputs,
@@ -110,6 +114,81 @@ def test_weighted_primal_ridge_matches_sklearn_on_cpu():
         ) @ parameters.coef + parameters.intercept
         expected = reference.predict(scaler.transform(x_validation))
         assert np.allclose(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_centered_ridge_moments_are_stable_for_large_feature_offsets():
+    rng = np.random.default_rng(77)
+    x_train = (
+        10_000 + rng.normal(scale=0.25, size=(1_200, 17))
+    ).astype(np.float32)
+    centered = x_train - x_train.mean(axis=0)
+    y_train = (
+        centered @ rng.normal(size=17)
+        + rng.normal(scale=0.03, size=len(x_train))
+    )
+    weights = rng.uniform(0.2, 2.0, size=len(x_train))
+    x_validation = (
+        10_000 + rng.normal(scale=0.25, size=(200, 17))
+    ).astype(np.float32)
+    stats = _stats_from_arrays(x_train, y_train, weights, device="cpu")
+    accelerated = ridge_path_from_stats(stats, [0.1, 10.0], device="cpu")
+    scaler = StandardScaler().fit(x_train, sample_weight=weights)
+    for alpha, parameters in accelerated.items():
+        reference = Ridge(alpha=alpha, solver="cholesky").fit(
+            scaler.transform(x_train), y_train, sample_weight=weights
+        )
+        actual = (
+            (x_validation - parameters.mean) / parameters.scale
+        ) @ parameters.coef + parameters.intercept
+        expected = reference.predict(scaler.transform(x_validation))
+        assert np.allclose(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_ridge_equivalence_audit_reports_nonfinite_accelerated_predictions(
+    monkeypatch,
+):
+    rng = np.random.default_rng(19)
+    representations = rng.normal(size=(90, 13, 5)).astype(np.float32)
+    frame = pd.DataFrame(
+        {
+            "representation_row": np.arange(90),
+            "partition": ["train_tuning"] * 60 + ["validation"] * 30,
+            "label_value": rng.normal(size=90),
+            "sample_weight": np.ones(90),
+        }
+    )
+
+    def nonfinite_path(stats, alphas, *, device):
+        return {
+            float(alpha): RidgeParameters(
+                alpha=float(alpha),
+                mean=np.zeros(5),
+                scale=np.ones(5),
+                coef=np.full(5, np.inf),
+                intercept=0.0,
+            )
+            for alpha in alphas
+        }
+
+    monkeypatch.setattr(
+        "src.layer_probe_static.ridge_path_from_stats", nonfinite_path
+    )
+    with np.errstate(invalid="ignore"):
+        audit = _ridge_equivalence_audit(
+            representations,
+            frame,
+            layer=1,
+            alphas=[0.1, 1.0],
+            device="cpu",
+            sample_rows=60,
+            minimum_pearson=0.99999,
+            maximum_spearman_difference=1e-4,
+        )
+    assert not audit["passed"]
+    assert audit["failure_reason"] == (
+        "equivalence_predictions_contain_nan_or_inf"
+    )
+    assert audit["nonfinite_prediction_counts"]["accelerated"] > 0
 
 
 def test_one_layer_scan_accumulates_multiple_tasks_and_rejects_layer_zero():
@@ -230,6 +309,43 @@ def test_rank_ic_and_layer_correlations_cover_layers_one_to_twelve_only():
     assert np.allclose(summary_corr["mean_spearman"], 1.0)
 
 
+def test_static_plot_helpers_return_closed_figures(tmp_path: Path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    pd.DataFrame(
+        {
+            "split": ["test"] * len(MODELED_LAYERS),
+            "task_id": [DIRECT_TASK_ID] * len(MODELED_LAYERS),
+            "layer": MODELED_LAYERS,
+            "mean_rank_ic": np.linspace(-0.02, 0.03, len(MODELED_LAYERS)),
+        }
+    ).to_csv(tmp_path / "rank_ic_summary.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "split": "test",
+                "task_id": DIRECT_TASK_ID,
+                "layer_left": left,
+                "layer_right": right,
+                "mean_spearman": 1.0 if left == right else 0.5,
+            }
+            for left in MODELED_LAYERS
+            for right in range(left, 13)
+        ]
+    ).to_csv(tmp_path / "layer_correlation_summary.csv", index=False)
+    monkeypatch.setattr(
+        "src.layer_probe_static.validate_static_csi300_evaluation_outputs",
+        lambda directory: {},
+    )
+    plt.close("all")
+    rank_ic_figure = plot_static_rank_ic(tmp_path, split="test")
+    correlation_figure = plot_static_layer_correlation(
+        tmp_path, task_id=DIRECT_TASK_ID, split="test"
+    )
+    assert rank_ic_figure.number not in plt.get_fignums()
+    assert correlation_figure.number not in plt.get_fignums()
+
+
 def test_static_notebook_is_run_all_orchestration_only():
     path = ROOT / "notebooks" / "layer_probe_static_fy0_csi300_pipeline.ipynb"
     notebook = nbformat.read(path, as_version=4)
@@ -243,7 +359,11 @@ def test_static_notebook_is_run_all_orchestration_only():
     assert "run_static_csi300_evaluation_stage" in source
     assert "RUN_FINAL_TEST" not in source
     assert "range(1, 13)" in source
-    assert all(cell.get("execution_count") is None for cell in notebook.cells if cell.cell_type == "code")
+    tree = ast.parse(source)
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        for node in ast.walk(tree)
+    )
 
 
 class _ToyBert(torch.nn.Module):

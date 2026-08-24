@@ -1028,6 +1028,7 @@ def plot_representation_layer_norms(
     )
     ax.grid(alpha=0.2)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 

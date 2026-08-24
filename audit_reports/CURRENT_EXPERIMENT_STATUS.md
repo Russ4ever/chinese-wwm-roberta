@@ -65,10 +65,22 @@ state that has only been reported through the running notebook.
   alpha grid, validates the Torch solver against sklearn, and defaults to
   physical GPU 1.  It writes wide Layer 1-12 predictions rather than a
   duplicated long prediction table.
-- Local code validation completed: the new end-to-end synthetic Run All test
-  and the existing continuous/walk-forward/pipeline regression tests pass.
-  No real-data remote run of this alternative has been launched or claimed
-  complete yet.
+- A real-data remote notebook run was reported on 2026-08-24.  It reached the
+  report-level Ridge stage (notebook section 5) and failed in the preliminary
+  Torch-versus-sklearn equivalence audit before the 12-layer fits were written.
+  On the first TF32 attempt, `pearsonr` received NaN/Inf after both prediction
+  paths had been built and raised instead of allowing the intended non-TF32
+  retry.  Because the sklearn fit immediately before it completed, the
+  cancellation-prone accelerated moment path is the primary suspect.  The
+  remote artifacts have not been synchronized back, so stages 1-4 remain
+  user-reported rather than locally verified and the Ridge/evaluation stages
+  are not complete.
+- The local fix replaces cancellation-prone raw second moments with centered
+  weighted online moments, records non-finite equivalence diagnostics, and
+  retries with TF32 disabled when the TF32 audit fails.  Plot helpers now close
+  returned Matplotlib figures so the notebook's explicit `display(...)` renders
+  each figure once.  Local validation after this fix is 78 passing tests,
+  including the synthetic Run All pipeline; this is code validation only.
 
 ## Confirmed label state
 

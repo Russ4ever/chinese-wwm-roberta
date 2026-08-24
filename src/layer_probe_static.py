@@ -680,15 +680,15 @@ def validate_direct_return_target_outputs(directory: str | Path) -> dict[str, ob
 class WeightedRidgeStats:
     n_rows: int
     sum_weight: float
-    sum_x: np.ndarray
-    sum_x2: np.ndarray
-    sum_y: float
-    gram: np.ndarray
-    x_y: np.ndarray
+    mean_x: np.ndarray
+    mean_y: float
+    centered_sum_x2: np.ndarray
+    centered_gram: np.ndarray
+    centered_x_y: np.ndarray
 
     @property
     def hidden_size(self) -> int:
-        return int(self.sum_x.shape[0])
+        return int(self.mean_x.shape[0])
 
 
 @dataclass(frozen=True)
@@ -708,15 +708,43 @@ def merge_weighted_ridge_stats(
     hidden = values[0].hidden_size
     if any(item.hidden_size != hidden for item in values):
         raise ValueError("Ridge统计量hidden_size不一致")
-    return WeightedRidgeStats(
-        n_rows=sum(item.n_rows for item in values),
-        sum_weight=float(sum(item.sum_weight for item in values)),
-        sum_x=np.sum([item.sum_x for item in values], axis=0),
-        sum_x2=np.sum([item.sum_x2 for item in values], axis=0),
-        sum_y=float(sum(item.sum_y for item in values)),
-        gram=np.sum([item.gram for item in values], axis=0),
-        x_y=np.sum([item.x_y for item in values], axis=0),
-    )
+    if any(item.sum_weight <= 0 for item in values):
+        raise ValueError("合并Ridge统计量时权重和必须为正")
+    merged = values[0]
+    for item in values[1:]:
+        left_weight = float(merged.sum_weight)
+        right_weight = float(item.sum_weight)
+        total_weight = left_weight + right_weight
+        mean_delta = item.mean_x - merged.mean_x
+        target_mean_delta = float(item.mean_y - merged.mean_y)
+        correction = left_weight * right_weight / total_weight
+        merged = WeightedRidgeStats(
+            n_rows=merged.n_rows + item.n_rows,
+            sum_weight=total_weight,
+            mean_x=(
+                merged.mean_x + mean_delta * (right_weight / total_weight)
+            ),
+            mean_y=(
+                merged.mean_y
+                + target_mean_delta * (right_weight / total_weight)
+            ),
+            centered_sum_x2=(
+                merged.centered_sum_x2
+                + item.centered_sum_x2
+                + np.square(mean_delta) * correction
+            ),
+            centered_gram=(
+                merged.centered_gram
+                + item.centered_gram
+                + np.outer(mean_delta, mean_delta) * correction
+            ),
+            centered_x_y=(
+                merged.centered_x_y
+                + item.centered_x_y
+                + mean_delta * target_mean_delta * correction
+            ),
+        )
+    return merged
 
 
 class _TorchMoments:
@@ -725,13 +753,17 @@ class _TorchMoments:
 
         self.n_rows = 0
         self.sum_weight = torch.zeros((), dtype=torch.float64, device=device)
-        self.sum_x = torch.zeros(hidden_size, dtype=torch.float64, device=device)
-        self.sum_x2 = torch.zeros(hidden_size, dtype=torch.float64, device=device)
-        self.sum_y = torch.zeros((), dtype=torch.float64, device=device)
-        self.gram = torch.zeros(
+        self.mean_x = torch.zeros(hidden_size, dtype=torch.float64, device=device)
+        self.mean_y = torch.zeros((), dtype=torch.float64, device=device)
+        self.centered_sum_x2 = torch.zeros(
+            hidden_size, dtype=torch.float64, device=device
+        )
+        self.centered_gram = torch.zeros(
             (hidden_size, hidden_size), dtype=torch.float64, device=device
         )
-        self.x_y = torch.zeros(hidden_size, dtype=torch.float64, device=device)
+        self.centered_x_y = torch.zeros(
+            hidden_size, dtype=torch.float64, device=device
+        )
 
     def update(self, x, y, weight) -> None:
         import torch
@@ -746,25 +778,59 @@ class _TorchMoments:
             raise ValueError("Ridge统计量输入含NaN/Inf")
         if not torch.isfinite(weight).all() or torch.any(weight <= 0):
             raise ValueError("Ridge统计量权重必须有限且为正")
-        weighted_x = x * weight[:, None]
-        root_weighted_x = x * torch.sqrt(weight)[:, None]
+        batch_weight = weight.sum(dtype=torch.float64)
+        batch_mean_x = (
+            (x * weight[:, None]).sum(dim=0, dtype=torch.float64) / batch_weight
+        )
+        batch_mean_y = (weight * y).sum(dtype=torch.float64) / batch_weight
+        centered_x = x - batch_mean_x.to(dtype=x.dtype)
+        centered_y = y - batch_mean_y.to(dtype=y.dtype)
+        root_weighted_x = centered_x * torch.sqrt(weight)[:, None]
+        batch_centered_sum_x2 = (
+            centered_x.square() * weight[:, None]
+        ).sum(dim=0, dtype=torch.float64)
+        batch_centered_gram = (
+            root_weighted_x.T @ root_weighted_x
+        ).to(torch.float64)
+        batch_centered_x_y = (
+            centered_x.T @ (weight * centered_y)
+        ).to(torch.float64)
+        if self.n_rows == 0:
+            self.mean_x.copy_(batch_mean_x)
+            self.mean_y.copy_(batch_mean_y)
+            self.centered_sum_x2.copy_(batch_centered_sum_x2)
+            self.centered_gram.copy_(batch_centered_gram)
+            self.centered_x_y.copy_(batch_centered_x_y)
+        else:
+            total_weight = self.sum_weight + batch_weight
+            mean_delta = batch_mean_x - self.mean_x
+            target_mean_delta = batch_mean_y - self.mean_y
+            correction = self.sum_weight * batch_weight / total_weight
+            self.centered_sum_x2 += (
+                batch_centered_sum_x2 + mean_delta.square() * correction
+            )
+            self.centered_gram += (
+                batch_centered_gram
+                + torch.outer(mean_delta, mean_delta) * correction
+            )
+            self.centered_x_y += (
+                batch_centered_x_y
+                + mean_delta * target_mean_delta * correction
+            )
+            self.mean_x += mean_delta * (batch_weight / total_weight)
+            self.mean_y += target_mean_delta * (batch_weight / total_weight)
         self.n_rows += int(len(x))
-        self.sum_weight += weight.sum(dtype=torch.float64)
-        self.sum_x += weighted_x.sum(dim=0, dtype=torch.float64)
-        self.sum_x2 += (weighted_x * x).sum(dim=0, dtype=torch.float64)
-        self.sum_y += (weight * y).sum(dtype=torch.float64)
-        self.gram += (root_weighted_x.T @ root_weighted_x).to(torch.float64)
-        self.x_y += (x.T @ (weight * y)).to(torch.float64)
+        self.sum_weight += batch_weight
 
     def freeze(self) -> WeightedRidgeStats:
         return WeightedRidgeStats(
             n_rows=self.n_rows,
             sum_weight=float(self.sum_weight.detach().cpu()),
-            sum_x=self.sum_x.detach().cpu().numpy(),
-            sum_x2=self.sum_x2.detach().cpu().numpy(),
-            sum_y=float(self.sum_y.detach().cpu()),
-            gram=self.gram.detach().cpu().numpy(),
-            x_y=self.x_y.detach().cpu().numpy(),
+            mean_x=self.mean_x.detach().cpu().numpy(),
+            mean_y=float(self.mean_y.detach().cpu()),
+            centered_sum_x2=self.centered_sum_x2.detach().cpu().numpy(),
+            centered_gram=self.centered_gram.detach().cpu().numpy(),
+            centered_x_y=self.centered_x_y.detach().cpu().numpy(),
         )
 
 
@@ -870,17 +936,19 @@ def ridge_path_from_stats(
         raise ValueError("Ridge alpha必须为正")
     if stats.n_rows < 2 or stats.sum_weight <= 0:
         raise ValueError("Ridge统计量样本不足")
-    mean = stats.sum_x / stats.sum_weight
-    variance = stats.sum_x2 / stats.sum_weight - np.square(mean)
+    mean = stats.mean_x
+    variance = stats.centered_sum_x2 / stats.sum_weight
     variance = np.maximum(variance, 0.0)
     scale = np.sqrt(variance)
     scale[~np.isfinite(scale) | (scale <= np.finfo(float).eps)] = 1.0
-    y_mean = stats.sum_y / stats.sum_weight
-    centered_gram = stats.gram - np.outer(stats.sum_x, stats.sum_x) / stats.sum_weight
-    centered_xy = stats.x_y - stats.sum_x * stats.sum_y / stats.sum_weight
-    standardized_gram = centered_gram / np.outer(scale, scale)
+    y_mean = stats.mean_y
+    standardized_gram = stats.centered_gram / np.outer(scale, scale)
     standardized_gram = (standardized_gram + standardized_gram.T) / 2.0
-    standardized_xy = centered_xy / scale
+    standardized_xy = stats.centered_x_y / scale
+    if not np.isfinite(standardized_gram).all() or not np.isfinite(
+        standardized_xy
+    ).all():
+        raise FloatingPointError("标准化Ridge统计量含NaN/Inf")
     gram = torch.from_numpy(standardized_gram).to(device=device, dtype=torch.float64)
     rhs = torch.from_numpy(standardized_xy).to(device=device, dtype=torch.float64)
     identity = torch.eye(stats.hidden_size, dtype=torch.float64, device=device)
@@ -892,6 +960,8 @@ def ridge_path_from_stats(
             coef = torch.cholesky_solve(rhs[:, None], factor).squeeze(1)
         else:
             coef = torch.linalg.solve(matrix, rhs)
+        if not torch.isfinite(coef).all():
+            raise FloatingPointError(f"Ridge求解结果含NaN/Inf: alpha={alpha}")
         result[alpha] = RidgeParameters(
             alpha=alpha,
             mean=mean.astype(np.float64, copy=True),
@@ -1018,6 +1088,28 @@ def _ridge_equivalence_audit(
     y_train = train["label_value"].to_numpy(dtype=float)
     y_validation = validation["label_value"].to_numpy(dtype=float)
     weights = train["sample_weight"].to_numpy(dtype=float)
+    nonfinite_inputs = {
+        "x_train": int(x_train.size - np.isfinite(x_train).sum()),
+        "x_validation": int(
+            x_validation.size - np.isfinite(x_validation).sum()
+        ),
+        "y_train": int(y_train.size - np.isfinite(y_train).sum()),
+        "y_validation": int(
+            y_validation.size - np.isfinite(y_validation).sum()
+        ),
+        "sample_weight": int(weights.size - np.isfinite(weights).sum()),
+    }
+    if any(nonfinite_inputs.values()) or np.any(weights <= 0):
+        raise ValueError(
+            "Ridge等价性审计原始输入无效: "
+            + json.dumps(
+                {
+                    "nonfinite_counts": nonfinite_inputs,
+                    "nonpositive_weight_rows": int(np.sum(weights <= 0)),
+                },
+                ensure_ascii=False,
+            )
+        )
     accelerated_stats = _stats_from_arrays(
         x_train, y_train, weights, device=device
     )
@@ -1041,6 +1133,28 @@ def _ridge_equivalence_audit(
         )
         reference_columns.append(model.predict(x_validation_scaled))
     reference = np.column_stack(reference_columns)
+    nonfinite_predictions = {
+        "accelerated": int(accelerated.size - np.isfinite(accelerated).sum()),
+        "reference": int(reference.size - np.isfinite(reference).sum()),
+    }
+    base_result = {
+        "rows_train": len(train),
+        "rows_validation": len(validation),
+        "nonfinite_input_counts": nonfinite_inputs,
+        "nonfinite_prediction_counts": nonfinite_predictions,
+        "required_minimum_pearson": minimum_pearson,
+        "allowed_maximum_spearman_difference": maximum_spearman_difference,
+    }
+    if any(nonfinite_predictions.values()):
+        return {
+            "passed": False,
+            **base_result,
+            "failure_reason": "equivalence_predictions_contain_nan_or_inf",
+            "minimum_prediction_pearson": None,
+            "maximum_validation_spearman_difference": None,
+            "accelerated_selected_alpha": None,
+            "reference_selected_alpha": None,
+        }
     pearsons = []
     differences = []
     for index in range(reference.shape[1]):
@@ -1052,12 +1166,41 @@ def _ridge_equivalence_audit(
                 - _safe_spearman(reference[:, index], y_validation)
             )
         )
-    accelerated_alpha, _ = select_alpha_by_report_spearman(
-        accelerated, y_validation, list(accelerated_path)
-    )
-    reference_alpha, _ = select_alpha_by_report_spearman(
-        reference, y_validation, list(accelerated_path)
-    )
+    if not np.isfinite(pearsons).all() or not np.isfinite(differences).all():
+        return {
+            "passed": False,
+            **base_result,
+            "failure_reason": "equivalence_metrics_are_nonfinite",
+            "minimum_prediction_pearson": (
+                float(np.nanmin(pearsons))
+                if np.isfinite(pearsons).any()
+                else None
+            ),
+            "maximum_validation_spearman_difference": (
+                float(np.nanmax(differences))
+                if np.isfinite(differences).any()
+                else None
+            ),
+            "accelerated_selected_alpha": None,
+            "reference_selected_alpha": None,
+        }
+    try:
+        accelerated_alpha, _ = select_alpha_by_report_spearman(
+            accelerated, y_validation, list(accelerated_path)
+        )
+        reference_alpha, _ = select_alpha_by_report_spearman(
+            reference, y_validation, list(accelerated_path)
+        )
+    except ValueError as error:
+        return {
+            "passed": False,
+            **base_result,
+            "failure_reason": f"alpha_selection_failed: {error}",
+            "minimum_prediction_pearson": min(pearsons),
+            "maximum_validation_spearman_difference": max(differences),
+            "accelerated_selected_alpha": None,
+            "reference_selected_alpha": None,
+        }
     passed = (
         min(pearsons) >= minimum_pearson
         and max(differences) <= maximum_spearman_difference
@@ -1065,14 +1208,12 @@ def _ridge_equivalence_audit(
     )
     return {
         "passed": bool(passed),
-        "rows_train": len(train),
-        "rows_validation": len(validation),
+        **base_result,
+        "failure_reason": None if passed else "equivalence_threshold_not_met",
         "minimum_prediction_pearson": min(pearsons),
         "maximum_validation_spearman_difference": max(differences),
         "accelerated_selected_alpha": accelerated_alpha,
         "reference_selected_alpha": reference_alpha,
-        "required_minimum_pearson": minimum_pearson,
-        "allowed_maximum_spearman_difference": maximum_spearman_difference,
     }
 
 
@@ -1277,21 +1418,31 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
     representative = frames[STATIC_TASKS[0]]
     tf32_modes = [True, False] if device.startswith("cuda") else [False]
     numerical_audit = None
+    numerical_audit_attempts: list[dict[str, object]] = []
     selected_tf32 = False
     for allow_tf32 in tf32_modes:
         if device.startswith("cuda"):
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        audit = _ridge_equivalence_audit(
-            representations,
-            representative,
-            layer=1,
-            alphas=alphas,
-            device=device,
-            sample_rows=int(ridge_cfg.get("validation_sample_rows", 4096)),
-            minimum_pearson=minimum_pearson,
-            maximum_spearman_difference=maximum_spearman_difference,
-        )
+        try:
+            audit = _ridge_equivalence_audit(
+                representations,
+                representative,
+                layer=1,
+                alphas=alphas,
+                device=device,
+                sample_rows=int(ridge_cfg.get("validation_sample_rows", 4096)),
+                minimum_pearson=minimum_pearson,
+                maximum_spearman_difference=maximum_spearman_difference,
+            )
+        except (FloatingPointError, RuntimeError, ValueError) as error:
+            audit = {
+                "passed": False,
+                "failure_reason": (
+                    f"{type(error).__name__}: {error}"
+                ),
+            }
         audit["allow_tf32"] = allow_tf32
+        numerical_audit_attempts.append(audit)
         numerical_audit = audit
         if audit["passed"]:
             selected_tf32 = allow_tf32
@@ -1299,7 +1450,9 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
     if numerical_audit is None or not numerical_audit["passed"]:
         raise RuntimeError(
             "GPU Ridge未通过sklearn等价性检查: "
-            + json.dumps(numerical_audit, ensure_ascii=False, default=str)
+            + json.dumps(
+                numerical_audit_attempts, ensure_ascii=False, default=str
+            )
         )
     if device.startswith("cuda"):
         torch.backends.cuda.matmul.allow_tf32 = selected_tf32
@@ -1455,6 +1608,7 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
                     "row_chunk_benchmark": chunk_benchmark,
                     "allow_tf32": selected_tf32,
                     "numerical_equivalence": numerical_audit,
+                    "numerical_equivalence_attempts": numerical_audit_attempts,
                     "gpu_runtime": gpu_audit,
                     "cpu_runtime": runtime_audit,
                     "disk_preflight": disk_audit,
@@ -2058,6 +2212,7 @@ def plot_static_rank_ic(directory: str | Path, *, split: str = "test"):
         axis.set(title=task_id, xlabel="Layer", ylabel="Mean RankIC")
         axis.grid(alpha=0.2)
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 
@@ -2090,6 +2245,7 @@ def plot_static_layer_correlation(
     ax.set(title=f"{task_id} — {split}", xlabel="Layer", ylabel="Layer")
     fig.colorbar(image, ax=ax, label="Mean daily Spearman")
     fig.tight_layout()
+    plt.close(fig)
     return fig
 
 

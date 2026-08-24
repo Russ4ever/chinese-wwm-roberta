@@ -76,8 +76,8 @@ report_ridge:
   minimum_train_rows: 100
   minimum_validation_rows: 100
   numerical_validation:
-    minimum_prediction_pearson: 0.99999
-    maximum_spearman_difference: 1.0e-4
+    minimum_prediction_pearson: 0.9999
+    maximum_spearman_difference: 1.0e-3
 
 direct_return:
   enabled: true

@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from src.layer_probe_static import (
 )
 from src.layer_probe_representations import (
     extract_cls_representations,
+    protocol_config_hash,
     write_representation_pointer,
 )
 
@@ -64,6 +66,34 @@ def test_static_protocol_rejects_layer_zero_ridge():
     config["static_protocol"]["modeled_layers"] = list(range(13))
     with pytest.raises(ValueError, match="Layer 1~12"):
         parse_static_protocol(config)
+
+
+def test_solver_audit_thresholds_do_not_invalidate_upstream_config_hash():
+    relaxed = _config()
+    assert relaxed["report_ridge"]["numerical_validation"] == {
+        "minimum_prediction_pearson": 0.9999,
+        "maximum_spearman_difference": 1e-3,
+    }
+    strict = _config()
+    strict["report_ridge"]["numerical_validation"] = {
+        "minimum_prediction_pearson": 0.99999,
+        "maximum_spearman_difference": 1e-4,
+    }
+    assert protocol_config_hash(relaxed) == protocol_config_hash(strict)
+    legacy_normalized = json.loads(
+        json.dumps(strict, sort_keys=True, default=str)
+    )
+    legacy_normalized.pop("sentiment_appendix", None)
+    legacy_hash = hashlib.sha256(
+        json.dumps(
+            legacy_normalized,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert protocol_config_hash(relaxed) == legacy_hash
+    strict["report_ridge"]["alpha_grid"] = [0.1, 1.0]
+    assert protocol_config_hash(relaxed) != protocol_config_hash(strict)
 
 
 def test_direct_return_partition_purges_only_cross_boundary_rows():
@@ -142,6 +172,33 @@ def test_centered_ridge_moments_are_stable_for_large_feature_offsets():
         ) @ parameters.coef + parameters.intercept
         expected = reference.predict(scaler.transform(x_validation))
         assert np.allclose(actual, expected, atol=2e-4, rtol=2e-4)
+
+    double_stats = _stats_from_arrays(
+        x_train,
+        y_train.astype(np.float32),
+        weights.astype(np.float32),
+        device="cpu",
+        accumulation_dtype="float64",
+    )
+    double_parameters = ridge_path_from_stats(
+        double_stats, [0.1], device="cpu"
+    )[0.1]
+    double_scaler = StandardScaler().fit(
+        x_train.astype(np.float64),
+        sample_weight=weights.astype(np.float64),
+    )
+    double_reference = Ridge(alpha=0.1, solver="cholesky").fit(
+        double_scaler.transform(x_train.astype(np.float64)),
+        y_train.astype(np.float32).astype(np.float64),
+        sample_weight=weights.astype(np.float32).astype(np.float64),
+    )
+    double_actual = (
+        (x_validation - double_parameters.mean) / double_parameters.scale
+    ) @ double_parameters.coef + double_parameters.intercept
+    double_expected = double_reference.predict(
+        double_scaler.transform(x_validation.astype(np.float64))
+    )
+    assert np.allclose(double_actual, double_expected, atol=1e-9, rtol=1e-9)
 
 
 def test_ridge_equivalence_audit_reports_nonfinite_accelerated_predictions(
@@ -567,5 +624,16 @@ def test_static_pipeline_toy_end_to_end(tmp_path: Path):
     assert set(selections["task_id"]) == set(STATIC_TASKS).union({DIRECT_TASK_ID})
     assert set(selections["layer"]) == set(MODELED_LAYERS)
     assert 0 not in set(selections["layer"])
+    probe_manifest = json.loads(
+        (
+            Path(config["output"]["run_directory"])
+            / "report_ridge_probes"
+            / "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert probe_manifest["selected_stats_accumulation_dtype"] in {
+        "float32",
+        "float64",
+    }
     rank_ic = pd.read_csv(output / "rank_ic_summary.csv")
     assert set(rank_ic["split"]) == {"validation", "test"}

@@ -748,10 +748,21 @@ def merge_weighted_ridge_stats(
 
 
 class _TorchMoments:
-    def __init__(self, hidden_size: int, *, device: str):
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        device: str,
+        accumulation_dtype: str = "float32",
+    ):
         import torch
 
+        if accumulation_dtype not in {"float32", "float64"}:
+            raise ValueError("Ridge统计量累积精度必须是float32或float64")
         self.n_rows = 0
+        self.accumulation_dtype = (
+            torch.float32 if accumulation_dtype == "float32" else torch.float64
+        )
         self.sum_weight = torch.zeros((), dtype=torch.float64, device=device)
         self.mean_x = torch.zeros(hidden_size, dtype=torch.float64, device=device)
         self.mean_y = torch.zeros((), dtype=torch.float64, device=device)
@@ -778,22 +789,28 @@ class _TorchMoments:
             raise ValueError("Ridge统计量输入含NaN/Inf")
         if not torch.isfinite(weight).all() or torch.any(weight <= 0):
             raise ValueError("Ridge统计量权重必须有限且为正")
-        batch_weight = weight.sum(dtype=torch.float64)
+        stats_x = x.to(dtype=self.accumulation_dtype)
+        stats_y = y.to(dtype=self.accumulation_dtype)
+        stats_weight = weight.to(dtype=self.accumulation_dtype)
+        batch_weight = stats_weight.sum(dtype=torch.float64)
         batch_mean_x = (
-            (x * weight[:, None]).sum(dim=0, dtype=torch.float64) / batch_weight
+            (stats_x * stats_weight[:, None]).sum(dim=0, dtype=torch.float64)
+            / batch_weight
         )
-        batch_mean_y = (weight * y).sum(dtype=torch.float64) / batch_weight
-        centered_x = x - batch_mean_x.to(dtype=x.dtype)
-        centered_y = y - batch_mean_y.to(dtype=y.dtype)
-        root_weighted_x = centered_x * torch.sqrt(weight)[:, None]
+        batch_mean_y = (
+            stats_weight * stats_y
+        ).sum(dtype=torch.float64) / batch_weight
+        centered_x = stats_x - batch_mean_x.to(dtype=self.accumulation_dtype)
+        centered_y = stats_y - batch_mean_y.to(dtype=self.accumulation_dtype)
+        root_weighted_x = centered_x * torch.sqrt(stats_weight)[:, None]
         batch_centered_sum_x2 = (
-            centered_x.square() * weight[:, None]
+            centered_x.square() * stats_weight[:, None]
         ).sum(dim=0, dtype=torch.float64)
         batch_centered_gram = (
             root_weighted_x.T @ root_weighted_x
         ).to(torch.float64)
         batch_centered_x_y = (
-            centered_x.T @ (weight * centered_y)
+            centered_x.T @ (stats_weight * centered_y)
         ).to(torch.float64)
         if self.n_rows == 0:
             self.mean_x.copy_(batch_mean_x)
@@ -840,13 +857,18 @@ def _stats_from_arrays(
     weight: np.ndarray,
     *,
     device: str,
+    accumulation_dtype: str = "float32",
 ) -> WeightedRidgeStats:
     import torch
 
     values = np.asarray(x, dtype=np.float32)
     target = np.asarray(y, dtype=np.float32)
     weights = np.asarray(weight, dtype=np.float32)
-    accumulator = _TorchMoments(values.shape[1], device=device)
+    accumulator = _TorchMoments(
+        values.shape[1],
+        device=device,
+        accumulation_dtype=accumulation_dtype,
+    )
     accumulator.update(
         torch.from_numpy(values).to(device),
         torch.from_numpy(target).to(device),
@@ -864,6 +886,7 @@ def accumulate_layer_statistics(
     ],
     device: str,
     row_chunk_size: int,
+    accumulation_dtype: str = "float32",
 ) -> dict[tuple[str, str], WeightedRidgeStats]:
     """Read one complete layer once and update every task/partition statistic."""
 
@@ -894,7 +917,9 @@ def accumulate_layer_statistics(
             raise ValueError(f"{key}在同一任务分区内含重复representation_row")
         prepared[key] = (rows, y, weight)
         accumulators[key] = _TorchMoments(
-            int(representations.shape[2]), device=device
+            int(representations.shape[2]),
+            device=device,
+            accumulation_dtype=accumulation_dtype,
         )
     for start in range(0, len(representations), int(row_chunk_size)):
         end = min(start + int(row_chunk_size), len(representations))
@@ -1065,6 +1090,7 @@ def _ridge_equivalence_audit(
     sample_rows: int,
     minimum_pearson: float,
     maximum_spearman_difference: float,
+    accumulation_dtype: str = "float32",
 ) -> dict[str, object]:
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
@@ -1085,9 +1111,9 @@ def _ridge_equivalence_audit(
         ],
         dtype=np.float32,
     )
-    y_train = train["label_value"].to_numpy(dtype=float)
-    y_validation = validation["label_value"].to_numpy(dtype=float)
-    weights = train["sample_weight"].to_numpy(dtype=float)
+    y_train = train["label_value"].to_numpy(dtype=np.float32)
+    y_validation = validation["label_value"].to_numpy(dtype=np.float32)
+    weights = train["sample_weight"].to_numpy(dtype=np.float32)
     nonfinite_inputs = {
         "x_train": int(x_train.size - np.isfinite(x_train).sum()),
         "x_validation": int(
@@ -1111,7 +1137,11 @@ def _ridge_equivalence_audit(
             )
         )
     accelerated_stats = _stats_from_arrays(
-        x_train, y_train, weights, device=device
+        x_train,
+        y_train,
+        weights,
+        device=device,
+        accumulation_dtype=accumulation_dtype,
     )
     accelerated_path = ridge_path_from_stats(
         accelerated_stats, alphas, device=device
@@ -1123,13 +1153,24 @@ def _ridge_equivalence_audit(
             for model in accelerated_path.values()
         ]
     )
-    scaler = StandardScaler().fit(x_train, sample_weight=weights)
-    x_train_scaled = scaler.transform(x_train)
-    x_validation_scaled = scaler.transform(x_validation)
+    reference_dtype = (
+        np.float64 if accumulation_dtype == "float64" else np.float32
+    )
+    reference_weights = weights.astype(reference_dtype, copy=False)
+    reference_y_train = y_train.astype(reference_dtype, copy=False)
+    reference_x_train = x_train.astype(reference_dtype, copy=False)
+    reference_x_validation = x_validation.astype(reference_dtype, copy=False)
+    scaler = StandardScaler().fit(
+        reference_x_train, sample_weight=reference_weights
+    )
+    x_train_scaled = scaler.transform(reference_x_train)
+    x_validation_scaled = scaler.transform(reference_x_validation)
     reference_columns = []
     for alpha in accelerated_path:
         model = Ridge(alpha=alpha, solver="cholesky").fit(
-            x_train_scaled, y_train, sample_weight=weights
+            x_train_scaled,
+            reference_y_train,
+            sample_weight=reference_weights,
         )
         reference_columns.append(model.predict(x_validation_scaled))
     reference = np.column_stack(reference_columns)
@@ -1142,6 +1183,7 @@ def _ridge_equivalence_audit(
         "rows_validation": len(validation),
         "nonfinite_input_counts": nonfinite_inputs,
         "nonfinite_prediction_counts": nonfinite_predictions,
+        "stats_accumulation_dtype": accumulation_dtype,
         "required_minimum_pearson": minimum_pearson,
         "allowed_maximum_spearman_difference": maximum_spearman_difference,
     }
@@ -1350,6 +1392,32 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
     if not alphas or min(alphas) <= 0:
         raise ValueError("report_ridge.alpha_grid必须含正数")
     device = str(ridge_cfg.get("device", "cuda:1"))
+    numeric_cfg = ridge_cfg.get("numerical_validation", {})
+    if not isinstance(numeric_cfg, Mapping):
+        raise ValueError("report_ridge.numerical_validation必须是对象")
+    minimum_pearson = float(
+        numeric_cfg.get("minimum_prediction_pearson", 0.9999)
+    )
+    maximum_spearman_difference = float(
+        numeric_cfg.get("maximum_spearman_difference", 1e-3)
+    )
+    configured_accumulation_dtype = str(
+        ridge_cfg.get("stats_accumulation_dtype", "float32")
+    )
+    if configured_accumulation_dtype not in {"float32", "float64"}:
+        raise ValueError(
+            "report_ridge.stats_accumulation_dtype必须是float32或float64"
+        )
+    numerical_policy = {
+        "minimum_prediction_pearson": minimum_pearson,
+        "maximum_spearman_difference": maximum_spearman_difference,
+        "configured_stats_accumulation_dtype": configured_accumulation_dtype,
+    }
+    numerical_policy_sha256 = hashlib.sha256(
+        json.dumps(
+            numerical_policy, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
     representations, _, _, rep_manifest, _ = _load_representation_bundle(config)
     frames = _prepare_probe_frames(config)
     static_manifest = _static_target_output(config) / "manifest.json"
@@ -1361,6 +1429,7 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
         "representation_fingerprint": rep_manifest["representation_fingerprint"],
         "static_target_manifest_sha256": sha256_file(static_manifest),
         "direct_target_manifest_sha256": sha256_file(direct_manifest),
+        "numerical_policy_sha256": numerical_policy_sha256,
     }
     if output.exists():
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
@@ -1408,19 +1477,21 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
         candidates=candidates,
         device=device,
     )
-    numeric_cfg = ridge_cfg.get("numerical_validation", {})
-    if not isinstance(numeric_cfg, Mapping):
-        raise ValueError("report_ridge.numerical_validation必须是对象")
-    minimum_pearson = float(numeric_cfg.get("minimum_prediction_pearson", 0.99999))
-    maximum_spearman_difference = float(
-        numeric_cfg.get("maximum_spearman_difference", 1e-4)
-    )
     representative = frames[STATIC_TASKS[0]]
-    tf32_modes = [True, False] if device.startswith("cuda") else [False]
+    numerical_modes: list[tuple[bool, str]] = []
+    if configured_accumulation_dtype == "float32":
+        if device.startswith("cuda"):
+            numerical_modes.extend([(True, "float32"), (False, "float32")])
+        else:
+            numerical_modes.append((False, "float32"))
+        numerical_modes.append((False, "float64"))
+    else:
+        numerical_modes.append((False, "float64"))
     numerical_audit = None
     numerical_audit_attempts: list[dict[str, object]] = []
     selected_tf32 = False
-    for allow_tf32 in tf32_modes:
+    selected_accumulation_dtype = configured_accumulation_dtype
+    for allow_tf32, accumulation_dtype in numerical_modes:
         if device.startswith("cuda"):
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         try:
@@ -1433,6 +1504,7 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
                 sample_rows=int(ridge_cfg.get("validation_sample_rows", 4096)),
                 minimum_pearson=minimum_pearson,
                 maximum_spearman_difference=maximum_spearman_difference,
+                accumulation_dtype=accumulation_dtype,
             )
         except (FloatingPointError, RuntimeError, ValueError) as error:
             audit = {
@@ -1442,10 +1514,12 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
                 ),
             }
         audit["allow_tf32"] = allow_tf32
+        audit["stats_accumulation_dtype"] = accumulation_dtype
         numerical_audit_attempts.append(audit)
         numerical_audit = audit
         if audit["passed"]:
             selected_tf32 = allow_tf32
+            selected_accumulation_dtype = accumulation_dtype
             break
     if numerical_audit is None or not numerical_audit["passed"]:
         raise RuntimeError(
@@ -1479,6 +1553,7 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
             partitions=partitions,
             device=device,
             row_chunk_size=row_chunk_size,
+            accumulation_dtype=selected_accumulation_dtype,
         )
         for task_id, frame in frames.items():
             train_key = (task_id, "train_tuning")
@@ -1607,6 +1682,13 @@ def run_static_report_probe_stage(config: Mapping[str, object]) -> Path:
                     "row_chunk_size": row_chunk_size,
                     "row_chunk_benchmark": chunk_benchmark,
                     "allow_tf32": selected_tf32,
+                    "configured_stats_accumulation_dtype": (
+                        configured_accumulation_dtype
+                    ),
+                    "selected_stats_accumulation_dtype": (
+                        selected_accumulation_dtype
+                    ),
+                    "numerical_policy": numerical_policy,
                     "numerical_equivalence": numerical_audit,
                     "numerical_equivalence_attempts": numerical_audit_attempts,
                     "gpu_runtime": gpu_audit,
@@ -1645,6 +1727,13 @@ def validate_static_report_probe_outputs(directory: str | Path) -> dict[str, obj
         raise ValueError("静态研报Ridge schema不匹配")
     if tuple(manifest.get("modeled_layers", [])) != MODELED_LAYERS:
         raise ValueError("静态研报Ridge建模层不是Layer 1~12")
+    if manifest.get("selected_stats_accumulation_dtype") not in {
+        "float32",
+        "float64",
+    }:
+        raise ValueError("静态研报Ridge缺少有效的统计量累积精度记录")
+    if not isinstance(manifest.get("numerical_policy_sha256"), str):
+        raise ValueError("静态研报Ridge缺少数值审计策略指纹")
     if 0 in manifest.get("modeled_layers", []):
         raise ValueError("Layer 0错误进入Ridge")
     expected_tasks = set(STATIC_TASKS).union({DIRECT_TASK_ID})

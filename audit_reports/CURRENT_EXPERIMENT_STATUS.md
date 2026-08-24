@@ -79,8 +79,21 @@ state that has only been reported through the running notebook.
   weighted online moments, records non-finite equivalence diagnostics, and
   retries with TF32 disabled when the TF32 audit fails.  Plot helpers now close
   returned Matplotlib figures so the notebook's explicit `display(...)` renders
-  each figure once.  Local validation after this fix is 78 passing tests,
+  each figure once.  Local validation after this fix is 79 passing tests,
   including the synthetic Run All pipeline; this is code validation only.
+- A second reported section-5 attempt had no non-finite inputs or predictions
+  and selected alpha 1000 in both implementations, but both TF32 and FP32
+  missed the deliberately strict equivalence thresholds.  The FP32 attempt had
+  minimum prediction Pearson 0.9999064579 and maximum validation-Spearman
+  difference 0.0005920301, versus required 0.99999 and 0.0001.  The local code
+  now uses user-approved tolerances of minimum Pearson 0.9999 and maximum
+  validation-Spearman difference 0.001.  Under the reported values TF32 remains
+  rejected while FP32 passes with the same selected alpha; FP64 remains a final
+  audited fallback only.  Solver-audit tolerances are normalized out of the
+  upstream artifact hash, preserving compatibility with the existing
+  representation/fixed-head/target artifacts, while the Ridge output records a
+  separate numerical-policy fingerprint.  This revision has passed local tests
+  but has not yet been confirmed on the remote real-data run.
 
 ## Confirmed label state
 

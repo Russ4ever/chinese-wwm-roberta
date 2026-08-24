@@ -1,5 +1,13 @@
 # Aggregate audit reports
 
+## Active experiment handoff
+
+Before continuing the current full-history Layer Probe run, read
+[`CURRENT_EXPERIMENT_STATUS.md`](CURRENT_EXPERIMENT_STATUS.md). It records the
+confirmed label state, the reported-but-not-yet-verified server execution state,
+the exact active paths, and pending methodological decisions. Update it at every
+material handoff; do not infer experiment completion from the presence of code.
+
 This directory is intentionally tracked. It is reserved for small, aggregate,
 outcome-blind audit outputs (`.json` and `.md`) produced by repository audit
 commands. Do not place raw report text, label values, model arrays, Parquet files,

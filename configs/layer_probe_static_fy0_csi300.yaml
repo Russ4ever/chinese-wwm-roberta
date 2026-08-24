@@ -1,0 +1,125 @@
+# Static FY0 alternative protocol.  This intentionally differs from the
+# point-in-time walk-forward mainline: label_available_date is preserved for
+# audit but never filters train/validation/test membership.
+
+experiment:
+  name: continuous_label_layer_probe_static_fy0_csi300
+  run_id: ${LAYER_PROBE_RUN_ID:-static_fy0_csi300_2025h1_v1}
+  protocol_class: conflicting_alternative
+
+text:
+  path: ${LAYER_PROBE_TEXT_PATH:-artifacts/report_labels/reports.parquet}
+  id_column: ${LAYER_PROBE_TEXT_ID_COLUMN:-report_id}
+  text_column: ${LAYER_PROBE_TEXT_COLUMN:-text}
+  symbol_column: ${LAYER_PROBE_SYMBOL_COLUMN:-stock_code}
+  date_column: ${LAYER_PROBE_DATE_COLUMN:-available_date}
+  limit: null
+
+model:
+  checkpoint: ${CKPT_PATH:-chinese-wwm-roberta.ckpt}
+  base_model_dir: ${BASE_MODEL_DIR:-chinese-roberta-wwm-ext}
+  # With both GPUs visible this is physical GPU 1.  With
+  # CUDA_VISIBLE_DEVICES=1 set LAYER_PROBE_DEVICE=cuda:0.
+  device: ${LAYER_PROBE_DEVICE:-cuda:1}
+  compute_dtype: float16
+  storage_dtype: float16
+  batch_size: 128
+  batch_size_candidates: [64, 128, 256, 512]
+  max_length: 512
+  head_recipe: cls_fc
+  head_provenance: user_locked_assumption
+  layer12_rtol: null
+  layer12_atol: null
+
+continuous_targets:
+  bundle_directory: ${LAYER_PROBE_TARGET_BUNDLE:-artifacts/probe_dataset_walk_forward_v1}
+  task_ids:
+    - residual_signed_raw__fh0
+    - delta_log_dispersion__1m__fixed__fh0
+    - delta_log_dispersion__1m__market__fh0
+    - delta_log_dispersion__3m__fixed__fh0
+    - delta_log_dispersion__3m__market__fh0
+
+static_protocol:
+  enabled: true
+  pit_label_availability_enforced: false
+  continuous_label_embargo_days: 0
+  test_opened_in_same_run: true
+  descriptive_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  modeled_layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  train:
+    start: "2014-01-01"
+    end: "2022-12-31"
+  validation:
+    start: "2023-01-01"
+    end: "2024-12-31"
+  test:
+    start: "2025-01-01"
+    end: "2025-08-01"
+
+fixed_head_analysis:
+  enabled: true
+  saturation_thresholds: [0.90, 0.95, 0.99]
+
+report_ridge:
+  enabled: true
+  backend: torch_primal_gram
+  device: ${LAYER_PROBE_DEVICE:-cuda:1}
+  alpha_grid: [0.1, 1.0, 10.0, 100.0, 1000.0]
+  selection_metric: pooled_validation_report_spearman
+  alpha_tie_break: larger_alpha
+  row_chunk_candidates: [16384, 32768, 65536, 131072]
+  validation_sample_rows: 4096
+  prediction_dtype: float32
+  stats_accumulation_dtype: float32
+  solve_dtype: float64
+  minimum_train_rows: 100
+  minimum_validation_rows: 100
+  numerical_validation:
+    minimum_prediction_pearson: 0.99999
+    maximum_spearman_difference: 1.0e-4
+
+direct_return:
+  enabled: true
+  industry_adjusted_daily_path: ${LAYER_PROBE_SPECIFIC_RETURN_DAILY:-/home/intern_fjq_2026/data/target/target_close_spret.h5}
+  hdf_key: null
+  horizon: 5
+  target_column: target_return_rank_5d
+  sample_weight: inverse_reports_per_stock_day
+  purge_cross_split_horizon: true
+
+csi300_evaluation:
+  enabled: true
+  weights_path: ${LAYER_PROBE_CSI300_WEIGHTS:-/home/intern_fjq_2026/data/NLP/market/csi300_weights_20050101_20260820.parquet}
+  index_code: 000300.SH
+  membership: latest_snapshot_on_or_before_date
+  minimum_snapshot_constituents: 250
+  minimum_daily_observations: 20
+  return_horizon: 5
+  metrics: [rank_ic]
+
+layer_factor_correlations:
+  enabled: true
+  method: daily_cross_sectional_spearman
+  minimum_daily_observations: 20
+  within_task_only: true
+
+performance:
+  shared_server: true
+  max_threads: ${SHARED_SERVER_MAX_THREADS:-8}
+  blas_threads: 1
+  minimum_free_disk_gb: 15
+  minimum_free_disk_fraction: 0.20
+
+output:
+  representation_store: ${LAYER_PROBE_REPRESENTATION_STORE:-artifacts/continuous_label_layer_probe/representation_store_full_history_wf_v1}
+  run_directory: ${LAYER_PROBE_RUN_DIRECTORY:-artifacts/continuous_label_layer_probe/runs/static_fy0_csi300_2025h1_v1}
+
+stages:
+  representations: true
+  fixed_head: true
+  static_targets: true
+  direct_return_targets: true
+  report_ridge: true
+  csi300_rank_ic: true
+  layer_correlations: true

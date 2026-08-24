@@ -1,6 +1,6 @@
 # Current Layer Probe experiment status
 
-Last updated: 2026-08-24 (Asia/Shanghai)
+Last updated: 2026-08-25 (Asia/Shanghai)
 
 This file is the handoff source for the active full-history continuous-label
 Layer Probe run. Read it before modifying configs, rerunning a stage, or
@@ -112,6 +112,55 @@ state that has only been reported through the running notebook.
   `dense_residual_test_exploration_v1` inside the static run directory.  Local
   notebook structure and synthetic no-look-ahead tests pass, but no real-data
   remote execution of this densification notebook has yet been confirmed.
+
+## Label-free checkpoint activation-rank extension
+
+- On 2026-08-25 the independent extension `checkpoint_activation_rank_v1` was
+  implemented at:
+  - `configs/activation_rank.yaml`
+  - `notebooks/activation_rank_pipeline.ipynb`
+  - `src/activation_rank.py`
+  - `tests/test_activation_rank.py`
+- This extension does not read any label, return, exposure, or split artifact
+  and does not alter the continuous-label Layer Probe mainline or the static
+  alternative. Its scope is descriptive activation geometry of the current
+  frozen checkpoint on the canonical financial-report text distribution.
+- One backbone forward captures 49 sites: residual streams 0 through 12 and,
+  for each Transformer block, concatenated attention-head output `Z`, the
+  pre-residual attention output projection, and the pre-residual MLP dense
+  write. Ordinary tokens exclude tokenizer-marked special/PAD tokens; CLS is
+  accumulated separately. Attention matrices are never requested.
+- The implementation uses FP64 centered Chan/Welford moments, a 500k-token
+  precision/throughput pilot, stable eight-shard sampling, 0.5m/1m/2m/5m/10m
+  global token checkpoints, 5-sigma pilot-frozen filtering, paired shard
+  bootstrap evidence rules, full FP64 eigendecomposition, active-subspace
+  storage, and the `Sigma_O = W^O Sigma_Z (W^O)^T` mechanism audit. It stores no
+  raw token activations.
+- Long-run execution is resumable and fingerprint-gated. Sample, pilot,
+  primary shard, auxiliary stream, analysis, mechanism, and final manifests
+  reject incompatible or incomplete artifacts. Public core files are hardlinks
+  to their canonical stage artifacts so the expected paths do not duplicate
+  large matrices on disk. The main rank stage reuses one loaded model across
+  all missing shard segments, length-buckets batches, prefetches one tokenized
+  batch, keeps moments/norm counters on GPU, and defaults only to physical GPU
+  1 after the live shared-server gate passes.
+- The notebook has exactly eight orchestration cells. Run All is idempotent;
+  after a kernel restart at a shard failure, the import/config cell and shard
+  cell are sufficient, while already validated shards are skipped.
+- Local validation is **94 passing tests**, including 15 activation-rank tests
+  for centered moment/SVD equivalence, shard merge, hook positions and values,
+  token/CLS/duplicate cohort routing, covariance identity, collapse/bootstrap
+  boundaries, precision and batch selection, deterministic sampling, atomic
+  publication, corrupted-fingerprint rejection, auxiliary retry idempotence,
+  and notebook structure/AST. Formatting, static-name checks, compilation, and
+  diff whitespace checks also pass.
+- This is code validation only. No real checkpoint pilot, 5-million-token scan,
+  10-million-token continuation, eigendecomposition, or mechanism result has
+  been run or confirmed locally or on the remote server. The expected run path
+  is `artifacts/checkpoint_activation_rank/runs/financial_reports_v1`; no
+  manifest from that path may be treated as complete until synchronized and
+  hash-validated. Physical GPU 1 availability and current remote disk state
+  remain unconfirmed.
 
 ## Confirmed label state
 
@@ -229,6 +278,11 @@ start a second Stage 1 job while the first server kernel is still running.
 6. Resolve and test the Stage 5-6 composite-factor scale decision before final
    validation-factor interpretation.
 7. Keep final test closed and do not weaken label cutoffs to recover samples.
+8. Before the first real activation-rank run, synchronize the implementation,
+   inspect live physical GPU 1/processes/NUMA/CPU affinity/free disk, then run
+   notebook cells 1 through 4 and inspect the measured dtype, batch size,
+   padding ratio, peak memory, filtering thresholds, and 5m/10m ETA before
+   starting cell 5. Do not claim activation-rank completion from local tests.
 
 ## Code validation known at handoff
 
@@ -238,3 +292,6 @@ start a second Stage 1 job while the first server kernel is still running.
   as 65 passing tests and the new notebook structure/AST was validated.
 - This statement is code validation only, not evidence that the current
   full-data server experiment completed successfully.
+- The label-free activation-rank implementation added on 2026-08-25 raises the
+  full local suite to 94 passing tests. Its real pilot and main scan have not
+  been executed or verified.

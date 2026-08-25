@@ -1252,8 +1252,8 @@ def run_sample_stage(config: Mapping[str, object]) -> Path:
         table = temporary / "sample_manifest.parquet"
         sample.to_parquet(table, index=False, compression="zstd")
         manifest = {
-            **identity,
             "schema_version": SAMPLE_SCHEMA,
+            **identity,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "rows": int(len(sample)),
             "token_counts_by_shard": {
@@ -1432,6 +1432,7 @@ def _run_rows(
             _ = model(
                 **encoded,
                 output_hidden_states=False,
+                output_attentions=False,
             )
             hooks.assert_complete_forward()
             if hasattr(consumer, "assert_batch_valid"):
@@ -1820,8 +1821,8 @@ def run_pilot_stage(config: Mapping[str, object]) -> Path:
             ].iloc[0]
         )
         manifest = {
-            **identity,
             "schema_version": PILOT_SCHEMA,
+            **identity,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "selected_compute_dtype": selected_dtype,
             "pilot_valid_tokens": int(
@@ -2005,8 +2006,8 @@ def _publish_primary_shard(
             temporary / "checkpoint_metrics.parquet", index=False, compression="zstd"
         )
         manifest = {
-            **identity,
             "schema_version": SHARD_SCHEMA,
+            **identity,
             **dict(execution),
             "shard": int(shard),
             "processed_rows": int(processed_rows),
@@ -2477,8 +2478,8 @@ def run_rank_shards_stage(config: Mapping[str, object]) -> Path:
         raise RuntimeError("最终主样本norm/过滤审计失败")
     final_target = min(int(value["processed_tokens"]) for value in manifests if value)
     stage_manifest = {
-        **identity,
         "schema_version": SHARD_SCHEMA,
+        **identity,
         **execution,
         "completed_at": datetime.now().isoformat(timespec="seconds"),
         "shards": shards,
@@ -2671,8 +2672,8 @@ def run_rank_analysis_stage(config: Mapping[str, object]) -> Path:
             )
         }
         manifest = {
-            **identity,
             "schema_version": ANALYSIS_SCHEMA,
+            **identity,
             **execution,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "streams": list(streams),
@@ -2883,8 +2884,8 @@ def run_wo_mechanism_stage(config: Mapping[str, object]) -> Path:
             for filename in ("wo_mechanism.parquet", "wo_summary.parquet")
         }
         manifest = {
-            **identity,
             "schema_version": MECHANISM_SCHEMA,
+            **identity,
             **execution,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "files": files,
@@ -3015,8 +3016,8 @@ def finalize_activation_rank_run(config: Mapping[str, object]) -> Path:
     heatmap.savefig(figures / "normalized_effective_rank_heatmap.png", dpi=180)
     curves.savefig(figures / "normalized_effective_rank_curves.png", dpi=180)
     manifest = {
-        **identity,
         "schema_version": FINAL_SCHEMA,
+        **identity,
         **execution,
         "completed_at": datetime.now().isoformat(timespec="seconds"),
         "analysis_manifest_sha256": sha256_file(analysis / "manifest.json"),

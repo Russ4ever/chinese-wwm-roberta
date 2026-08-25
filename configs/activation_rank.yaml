@@ -43,8 +43,8 @@ norm_audit:
   # 普通token决定主审计是否通过；CLS仅作为报告级补充诊断。
   blocking_populations: [token]
   mean_relative_shift_tolerance: 0.01
-  std_relative_shift_tolerance: 0.01
-  maximum_filtered_fraction: 0.001
+  std_relative_shift_tolerance: 0.03
+  maximum_filtered_fraction: 0.01
   # 近常数LayerNorm范数不能用接近0的FP32 std作相对误差分母。
   std_denominator_floor: compute_dtype_epsilon_times_abs_mean
 

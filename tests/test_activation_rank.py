@@ -19,6 +19,7 @@ from src.activation_rank import (
     _atomic_npz,
     _length_bucketed_batches,
     _load_auxiliary_state,
+    _norm_audit,
     _precision_comparison,
     _publish_auxiliary_state,
     _publish_primary_shard,
@@ -27,6 +28,7 @@ from src.activation_rank import (
     activation_sites,
     arrays_to_moments,
     collapse_evidence,
+    compute_dtype_epsilon,
     covariance_eigendecomposition,
     load_activation_rank_config,
     moments_to_arrays,
@@ -37,6 +39,7 @@ from src.activation_rank import (
     scalar_moment_maps_to_state,
     select_activation_batch_size,
     select_compute_dtype,
+    select_norm_calibration,
     wo_mechanism_records,
 )
 
@@ -74,6 +77,9 @@ def test_protocol_config_and_49_sites_are_label_free():
         5000000,
         10000000,
     ]
+    assert config["sampling"]["hash_seed"] == "checkpoint_activation_rank_v1"
+    assert config["experiment"]["run_id"] == "financial_reports_v2"
+    assert config["output"]["run_directory"].endswith("financial_reports_v2")
     serialized = json.dumps(config).lower()
     for forbidden in (
         "sentiment_label",
@@ -142,6 +148,7 @@ def test_special_tokens_are_excluded_and_cls_and_unique_are_separate():
     assert consumer.streams["token_natural_unfiltered"]["residual_00"].count == 4
     assert consumer.streams["token_unique_filtered"]["residual_00"].count == 2
     assert consumer.streams["cls_natural_filtered"]["residual_00"].count == 2
+    assert consumer.streams["cls_natural_unfiltered"]["residual_00"].count == 2
 
 
 class _ToySelf(torch.nn.Module):
@@ -375,6 +382,105 @@ def test_dtype_and_batch_selection_obey_accuracy_and_headroom():
         )
         == 128
     )
+
+
+def test_selected_compute_dtype_also_controls_norm_calibration():
+    fp32 = {
+        population: {
+            site: ScalarMoments.from_array(np.array([1.0, 1.0])) for site in CORE_SITES
+        }
+        for population in ("token", "cls")
+    }
+    fp16 = {
+        population: {
+            site: ScalarMoments.from_array(np.array([2.0, 2.1])) for site in CORE_SITES
+        }
+        for population in ("token", "cls")
+    }
+    selected = select_norm_calibration({"float32": fp32, "float16": fp16}, "float16")
+    assert selected is fp16
+    assert compute_dtype_epsilon("float16") == pytest.approx(2.0**-10)
+    assert compute_dtype_epsilon("bfloat16") == pytest.approx(2.0**-7)
+    with pytest.raises(KeyError, match="selected dtype"):
+        select_norm_calibration({"float32": fp32}, "float16")
+
+
+def _scalar_with_mean_std(mean: float, std: float, count: int) -> ScalarMoments:
+    return ScalarMoments(
+        count=count,
+        mean=mean,
+        m2=std * std * (count - 1),
+        minimum=mean - std,
+        maximum=mean + std,
+    )
+
+
+def test_norm_audit_is_scale_aware_per_site_and_cls_is_nonblocking():
+    norms = {
+        population: {
+            site: _scalar_with_mean_std(10.0, 0.5, 10000) for site in CORE_SITES
+        }
+        for population in ("token", "cls")
+    }
+    pilot = {
+        f"{population}__{site}": {
+            "count": 2000,
+            "mean": 10.0,
+            "std": 0.5,
+        }
+        for population in ("token", "cls")
+        for site in CORE_SITES
+    }
+    filtered = {
+        f"{population}__{site}": 0
+        for population in ("token", "cls")
+        for site in CORE_SITES
+    }
+    policy = {
+        "blocking_populations": ["token"],
+        "mean_relative_shift_tolerance": 0.01,
+        "std_relative_shift_tolerance": 0.01,
+        "maximum_filtered_fraction": 0.001,
+        "std_denominator_floor": "compute_dtype_epsilon_times_abs_mean",
+    }
+
+    pilot["token__residual_00"]["std"] = 1e-8
+    norms["token"]["residual_00"] = _scalar_with_mean_std(10.0, 8e-5, 10000)
+    filtered["cls__residual_01"] = 5000
+    summary, table = _norm_audit(
+        norms,
+        filtered,
+        pilot,
+        compute_dtype="float16",
+        policy=policy,
+    )
+    assert len(table) == 2 * len(CORE_SITES)
+    assert summary["passed"] is True
+    assert summary["token_passed"] is True
+    assert summary["cls_passed"] is False
+    near_constant = table[
+        table["population"].eq("token") & table["site"].eq("residual_00")
+    ].iloc[0]
+    assert near_constant["std_denominator"] == pytest.approx(
+        compute_dtype_epsilon("float16") * 10.0
+    )
+    assert bool(near_constant["std_passed"])
+
+    filtered["token__residual_02"] = 100
+    failed, failed_table = _norm_audit(
+        norms,
+        filtered,
+        pilot,
+        compute_dtype="float16",
+        policy=policy,
+    )
+    assert failed["passed"] is False
+    assert failed["failed_blocking_position_count"] == 1
+    assert failed["failed_blocking_positions"][0]["site"] == "residual_02"
+    failed_row = failed_table[
+        failed_table["population"].eq("token") & failed_table["site"].eq("residual_02")
+    ].iloc[0]
+    assert failed_row["filtered_fraction"] == pytest.approx(0.01)
 
 
 def test_precision_comparison_detects_matching_and_distorted_spectra():

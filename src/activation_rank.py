@@ -38,20 +38,21 @@ from .layer_probe_representations import (
 from .models.modeling import build_candidate
 
 
-SCHEMA_VERSION = "checkpoint_activation_rank_v1.0"
-SAMPLE_SCHEMA = "activation_rank_sample_v1.0"
-PILOT_SCHEMA = "activation_rank_pilot_v1.0"
-SHARD_SCHEMA = "activation_rank_shard_v1.0"
-AUXILIARY_SCHEMA = "activation_rank_auxiliary_v1.0"
-ANALYSIS_SCHEMA = "activation_rank_analysis_v1.0"
-MECHANISM_SCHEMA = "activation_rank_wo_mechanism_v1.0"
-FINAL_SCHEMA = "activation_rank_run_v1.0"
+SCHEMA_VERSION = "checkpoint_activation_rank_v2.0"
+SAMPLE_SCHEMA = "activation_rank_sample_v2.0"
+PILOT_SCHEMA = "activation_rank_pilot_v2.0"
+SHARD_SCHEMA = "activation_rank_shard_v2.0"
+AUXILIARY_SCHEMA = "activation_rank_auxiliary_v2.0"
+ANALYSIS_SCHEMA = "activation_rank_analysis_v2.0"
+MECHANISM_SCHEMA = "activation_rank_wo_mechanism_v2.0"
+FINAL_SCHEMA = "activation_rank_run_v2.0"
 
 PRIMARY_STREAM = "token_natural_filtered"
 AUXILIARY_STREAMS = (
     "token_natural_unfiltered",
     "token_unique_filtered",
     "cls_natural_filtered",
+    "cls_natural_unfiltered",
 )
 ALL_STREAMS = (PRIMARY_STREAM,) + AUXILIARY_STREAMS
 
@@ -79,6 +80,7 @@ def load_activation_rank_config(path: str | Path) -> dict[str, object]:
         "model",
         "sampling",
         "numerics",
+        "norm_audit",
         "performance",
         "output",
     }
@@ -879,6 +881,7 @@ class ActivationMomentConsumer:
         unique_stream = self.streams["token_unique_filtered"][site]
         unique_stream.update(unique_values[unique_keep])
         self.streams["cls_natural_filtered"][site].update(cls_values[cls_keep])
+        self.streams["cls_natural_unfiltered"][site].update(cls_values)
 
     def assert_batch_valid(self) -> None:
         import torch
@@ -1611,6 +1614,27 @@ def select_compute_dtype(records: Sequence[Mapping[str, object]]) -> str:
     )
 
 
+def compute_dtype_epsilon(dtype_name: str) -> float:
+    normalized = str(dtype_name).lower()
+    values = {
+        "float32": float(np.finfo(np.float32).eps),
+        "float16": float(np.finfo(np.float16).eps),
+        "bfloat16": float(2.0**-7),
+    }
+    if normalized not in values:
+        raise ValueError(f"不支持的compute dtype epsilon: {dtype_name}")
+    return values[normalized]
+
+
+def select_norm_calibration(
+    norms_by_dtype: Mapping[str, Mapping[str, Mapping[str, ScalarMoments]]],
+    selected_dtype: str,
+) -> Mapping[str, Mapping[str, ScalarMoments]]:
+    if selected_dtype not in norms_by_dtype:
+        raise KeyError(f"缺少selected dtype的norm calibration: {selected_dtype}")
+    return norms_by_dtype[selected_dtype]
+
+
 def validate_pilot_outputs(
     directory: str | Path, expected: Mapping[str, object] | None = None
 ) -> dict[str, object]:
@@ -1650,6 +1674,10 @@ def validate_pilot_outputs(
     precision = pd.read_parquet(metrics)
     if "float32" not in set(precision["dtype"]) or not precision["passed"].any():
         raise ValueError("pilot缺少通过的float32 reference")
+    if manifest.get("norm_calibration_dtype") != manifest.get("selected_compute_dtype"):
+        raise RuntimeError("pilot norm calibration dtype与主扫描dtype不一致")
+    if not isinstance(manifest.get("norm_audit_policy_sha256"), str):
+        raise RuntimeError("pilot缺少norm audit policy fingerprint")
     return manifest
 
 
@@ -1657,11 +1685,13 @@ def _execution_identity(pilot_directory: Path) -> dict[str, object]:
     manifest = validate_pilot_outputs(pilot_directory)
     payload = {
         "selected_compute_dtype": manifest["selected_compute_dtype"],
+        "norm_calibration_dtype": manifest["norm_calibration_dtype"],
         "selected_batch_size": int(manifest["batch_size"]),
         "norm_thresholds_sha256": manifest["norm_thresholds_sha256"],
         "norm_stats_sha256": manifest["norm_stats_sha256"],
         "precision_metrics_sha256": manifest["precision_metrics_sha256"],
         "batch_benchmark_sha256": manifest["batch_benchmark_sha256"],
+        "norm_audit_policy_sha256": manifest["norm_audit_policy_sha256"],
     }
     payload["execution_fingerprint"] = _json_hash(payload)
     return payload
@@ -1715,7 +1745,7 @@ def run_pilot_stage(config: Mapping[str, object]) -> Path:
         torch.cuda.empty_cache()
     dtype_records: list[dict[str, object]] = []
     moment_results: dict[str, dict[str, OnlineMoments]] = {}
-    norm_results: dict[str, dict[str, ScalarMoments]] | None = None
+    norm_results_by_dtype: dict[str, dict[str, dict[str, ScalarMoments]]] = {}
     dtype_candidates = [
         str(value)
         for value in numerics.get(
@@ -1751,8 +1781,7 @@ def run_pilot_stage(config: Mapping[str, object]) -> Path:
         )
         exported = consumer.export()
         moment_results[dtype_name] = exported["token"]
-        if dtype_name == "float32":
-            norm_results = consumer.export_norms()
+        norm_results_by_dtype[dtype_name] = consumer.export_norms()
         peak = (
             int(torch.cuda.max_memory_allocated(device))
             if device.startswith("cuda")
@@ -1764,7 +1793,7 @@ def run_pilot_stage(config: Mapping[str, object]) -> Path:
         del consumer, model
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
-    if "float32" not in moment_results or norm_results is None:
+    if "float32" not in moment_results or "float32" not in norm_results_by_dtype:
         raise RuntimeError("pilot必须包含严格float32 reference")
     reference = moment_results["float32"]
     for record in dtype_records:
@@ -1781,6 +1810,7 @@ def run_pilot_stage(config: Mapping[str, object]) -> Path:
         )
         record.update(comparison)
     selected_dtype = select_compute_dtype(dtype_records)
+    norm_results = select_norm_calibration(norm_results_by_dtype, selected_dtype)
     thresholds = {
         f"{population}__{site}": float(
             stats.mean + float(numerics.get("outlier_sigma", 5.0)) * stats.std
@@ -1824,11 +1854,13 @@ def run_pilot_stage(config: Mapping[str, object]) -> Path:
             "schema_version": PILOT_SCHEMA,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "selected_compute_dtype": selected_dtype,
+            "norm_calibration_dtype": selected_dtype,
             "pilot_valid_tokens": int(
                 max(record["valid_tokens"] for record in dtype_records)
             ),
             "batch_size": batch_size,
             "norm_policy": f"population_site_mean_plus_{float(numerics.get('outlier_sigma', 5.0)):g}sigma",
+            "norm_audit_policy_sha256": _json_hash(_mapping(config, "norm_audit")),
             "norm_thresholds_sha256": sha256_file(threshold_path),
             "norm_stats_sha256": sha256_file(norm_stats_path),
             "precision_metrics_sha256": sha256_file(precision_path),
@@ -2040,42 +2072,142 @@ def _publish_primary_shard(
     return output
 
 
-def _norm_audit(
+def _norm_audit_table(
     norms: Mapping[str, Mapping[str, ScalarMoments]],
     filtered_counts: Mapping[str, int],
     pilot_norms: Mapping[str, Mapping[str, object]],
-) -> dict[str, object]:
-    max_mean_shift = 0.0
-    max_std_shift = 0.0
-    max_filtered_fraction = 0.0
+    *,
+    compute_dtype: str,
+    policy: Mapping[str, object],
+) -> pd.DataFrame:
+    blocking_populations = {
+        str(value) for value in policy.get("blocking_populations", ["token"])
+    }
+    if not blocking_populations or not blocking_populations.issubset({"token", "cls"}):
+        raise ValueError("norm_audit.blocking_populations只能包含token/cls且不能为空")
+    floor_policy = str(
+        policy.get("std_denominator_floor", "compute_dtype_epsilon_times_abs_mean")
+    )
+    if floor_policy != "compute_dtype_epsilon_times_abs_mean":
+        raise ValueError(f"不支持的norm std denominator floor: {floor_policy}")
+    mean_tolerance = float(policy.get("mean_relative_shift_tolerance", 0.01))
+    std_tolerance = float(policy.get("std_relative_shift_tolerance", 0.01))
+    filtered_tolerance = float(policy.get("maximum_filtered_fraction", 0.001))
+    if min(mean_tolerance, std_tolerance, filtered_tolerance) < 0:
+        raise ValueError("norm audit容差不能为负")
+    dtype_epsilon = compute_dtype_epsilon(compute_dtype)
+    records: list[dict[str, object]] = []
     for population in ("token", "cls"):
         for site in CORE_SITES:
             current = norms[population][site]
             reference = pilot_norms[f"{population}__{site}"]
             reference_mean = max(abs(float(reference["mean"])), 1e-12)
-            reference_std = max(abs(float(reference["std"])), 1e-12)
-            max_mean_shift = max(
-                max_mean_shift,
-                abs(current.mean - float(reference["mean"])) / reference_mean,
-            )
-            max_std_shift = max(
-                max_std_shift,
-                abs(current.std - float(reference["std"])) / reference_std,
-            )
+            reference_std = abs(float(reference["std"]))
+            std_denominator_floor = dtype_epsilon * reference_mean
+            std_denominator = max(reference_std, std_denominator_floor, 1e-12)
+            mean_shift = abs(current.mean - float(reference["mean"])) / reference_mean
+            std_shift = abs(current.std - reference_std) / std_denominator
             fraction = int(filtered_counts[f"{population}__{site}"]) / max(
                 current.count, 1
             )
-            max_filtered_fraction = max(max_filtered_fraction, fraction)
+            mean_passed = mean_shift <= mean_tolerance
+            std_passed = std_shift <= std_tolerance
+            filtered_passed = fraction <= filtered_tolerance
+            position_passed = mean_passed and std_passed and filtered_passed
+            records.append(
+                {
+                    "population": population,
+                    "site": site,
+                    "blocking": population in blocking_populations,
+                    "compute_dtype": compute_dtype,
+                    "dtype_epsilon": dtype_epsilon,
+                    "pilot_count": int(reference["count"]),
+                    "main_count": int(current.count),
+                    "pilot_mean": float(reference["mean"]),
+                    "main_mean": float(current.mean),
+                    "pilot_std": reference_std,
+                    "main_std": float(current.std),
+                    "std_denominator_floor": std_denominator_floor,
+                    "std_denominator": std_denominator,
+                    "relative_norm_mean_shift": mean_shift,
+                    "relative_norm_std_shift": std_shift,
+                    "filtered_count": int(filtered_counts[f"{population}__{site}"]),
+                    "filtered_fraction": fraction,
+                    "mean_tolerance": mean_tolerance,
+                    "std_tolerance": std_tolerance,
+                    "filtered_fraction_tolerance": filtered_tolerance,
+                    "mean_passed": mean_passed,
+                    "std_passed": std_passed,
+                    "filtered_passed": filtered_passed,
+                    "position_passed": position_passed,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def _summarize_norm_audit(
+    table: pd.DataFrame, *, compute_dtype: str
+) -> dict[str, object]:
+    def maximum_record(frame: pd.DataFrame, metric: str) -> dict[str, object]:
+        row = frame.loc[frame[metric].idxmax()]
+        return {
+            "value": float(row[metric]),
+            "population": str(row["population"]),
+            "site": str(row["site"]),
+        }
+
+    blocking = table[table["blocking"]]
+    token = table[table["population"].eq("token")]
+    cls = table[table["population"].eq("cls")]
+    failed = blocking[~blocking["position_passed"]]
+    cls_failed = cls[~cls["position_passed"]]
+    metrics = (
+        "relative_norm_mean_shift",
+        "relative_norm_std_shift",
+        "filtered_fraction",
+    )
     return {
-        "maximum_relative_norm_mean_shift": max_mean_shift,
-        "maximum_relative_norm_std_shift": max_std_shift,
-        "maximum_filtered_fraction": max_filtered_fraction,
-        "passed": bool(
-            max_mean_shift <= 0.01
-            and max_std_shift <= 0.01
-            and max_filtered_fraction <= 0.001
-        ),
+        "compute_dtype": compute_dtype,
+        "std_denominator_floor_policy": "compute_dtype_epsilon_times_abs_mean",
+        "blocking_populations": sorted(set(blocking["population"].astype(str))),
+        "passed": bool(blocking["position_passed"].all()),
+        "token_passed": bool(token["position_passed"].all()),
+        "cls_passed": bool(cls["position_passed"].all()),
+        "failed_blocking_position_count": int(len(failed)),
+        "failed_blocking_positions": failed[
+            [
+                "population",
+                "site",
+                "relative_norm_mean_shift",
+                "relative_norm_std_shift",
+                "filtered_fraction",
+            ]
+        ].to_dict("records"),
+        "cls_warning_position_count": int(len(cls_failed)),
+        "maxima": {
+            "all": {metric: maximum_record(table, metric) for metric in metrics},
+            "token": {metric: maximum_record(token, metric) for metric in metrics},
+            "cls": {metric: maximum_record(cls, metric) for metric in metrics},
+        },
     }
+
+
+def _norm_audit(
+    norms: Mapping[str, Mapping[str, ScalarMoments]],
+    filtered_counts: Mapping[str, int],
+    pilot_norms: Mapping[str, Mapping[str, object]],
+    *,
+    compute_dtype: str,
+    policy: Mapping[str, object],
+) -> tuple[dict[str, object], pd.DataFrame]:
+    table = _norm_audit_table(
+        norms,
+        filtered_counts,
+        pilot_norms,
+        compute_dtype=compute_dtype,
+        policy=policy,
+    )
+    return _summarize_norm_audit(table, compute_dtype=compute_dtype), table
 
 
 def _pilot_norm_reference(
@@ -2219,7 +2351,13 @@ def _run_one_shard_to_target(
         for population in ("token", "cls")
         for site in CORE_SITES
     }
-    audit = _norm_audit(cumulative_norms, cumulative_filtered, norm_reference)
+    audit, _ = _norm_audit(
+        cumulative_norms,
+        cumulative_filtered,
+        norm_reference,
+        compute_dtype=dtype_name,
+        policy=_mapping(config, "norm_audit"),
+    )
     new_processed_rows = len(target_rows)
     new_processed_tokens = int(target_rows["token_count"].sum())
     previous_checkpoints: list[dict[str, object]] = []
@@ -2325,7 +2463,9 @@ def _pooled_norm_audit(
     pilot_directory: Path,
     *,
     outlier_sigma: float,
-) -> dict[str, object]:
+    compute_dtype: str,
+    policy: Mapping[str, object],
+) -> tuple[dict[str, object], pd.DataFrame]:
     pooled = {
         population: {site: ScalarMoments() for site in CORE_SITES}
         for population in ("token", "cls")
@@ -2342,7 +2482,13 @@ def _pooled_norm_audit(
         for key in filtered:
             filtered[key] += int(manifest["filtered_counts"][key])
     reference = _pilot_norm_reference(pilot_directory, outlier_sigma=outlier_sigma)
-    return _norm_audit(pooled, filtered, reference)
+    return _norm_audit(
+        pooled,
+        filtered,
+        reference,
+        compute_dtype=compute_dtype,
+        policy=policy,
+    )
 
 
 def validate_rank_shards_outputs(
@@ -2364,6 +2510,11 @@ def validate_rank_shards_outputs(
     )
     if not bool(manifest.get("norm_audit", {}).get("passed")):
         raise RuntimeError("主运行全样本norm审计未通过")
+    audit_path = root / "norm_audit.parquet"
+    if not audit_path.is_file() or sha256_file(audit_path) != manifest.get(
+        "norm_audit_sha256"
+    ):
+        raise RuntimeError("主运行逐位置norm audit缺失或hash不匹配")
     for shard in range(shards):
         _validate_primary_shard(root.parent, identity, shard, execution)
     _load_auxiliary_state(root.parent, identity, execution)
@@ -2396,6 +2547,8 @@ def run_rank_shards_stage(config: Mapping[str, object]) -> Path:
     base, checkpoint = _model_paths(config)
     device = str(model_cfg.get("device", "cuda:1"))
     pilot_manifest = validate_pilot_outputs(pilot)
+    compute_dtype = str(pilot_manifest["selected_compute_dtype"])
+    norm_policy = _mapping(config, "norm_audit")
     model = build_candidate(
         str(base),
         str(checkpoint),
@@ -2426,14 +2579,19 @@ def run_rank_shards_stage(config: Mapping[str, object]) -> Path:
             _validate_primary_shard(root, identity, shard, execution)
             for shard in range(shards)
         ]
-        norm_audit = _pooled_norm_audit(
+        norm_audit, norm_audit_table = _pooled_norm_audit(
             [value for value in manifests if value],
             pilot,
             outlier_sigma=float(_mapping(config, "numerics").get("outlier_sigma", 5.0)),
+            compute_dtype=compute_dtype,
+            policy=norm_policy,
         )
+        _atomic_parquet(stage_directory / "norm_audit_5m.parquet", norm_audit_table)
+        _atomic_json(stage_directory / "norm_audit_5m.json", norm_audit)
         if not norm_audit["passed"]:
             raise RuntimeError(
-                "主样本norm/过滤审计失败，必须重建pilot而非静默调整: "
+                "普通token norm/过滤审计失败；逐位置明细已写入"
+                "moments/norm_audit_5m.parquet: "
                 + json.dumps(norm_audit, ensure_ascii=False)
             )
         stability = evaluate_checkpoint_stability(
@@ -2468,13 +2626,20 @@ def run_rank_shards_stage(config: Mapping[str, object]) -> Path:
         _validate_primary_shard(root, identity, shard, execution)
         for shard in range(shards)
     ]
-    norm_audit = _pooled_norm_audit(
+    norm_audit, norm_audit_table = _pooled_norm_audit(
         [value for value in manifests if value],
         pilot,
         outlier_sigma=float(_mapping(config, "numerics").get("outlier_sigma", 5.0)),
+        compute_dtype=compute_dtype,
+        policy=norm_policy,
     )
+    norm_audit_path = stage_directory / "norm_audit.parquet"
+    _atomic_parquet(norm_audit_path, norm_audit_table)
     if not norm_audit["passed"]:
-        raise RuntimeError("最终主样本norm/过滤审计失败")
+        _atomic_json(stage_directory / "norm_audit_failure.json", norm_audit)
+        raise RuntimeError(
+            "最终普通token norm/过滤审计失败；请检查moments/norm_audit.parquet"
+        )
     final_target = min(int(value["processed_tokens"]) for value in manifests if value)
     stage_manifest = {
         **identity,
@@ -2487,6 +2652,7 @@ def run_rank_shards_stage(config: Mapping[str, object]) -> Path:
         "stopping_decision": stopping,
         "stability": stability,
         "norm_audit": norm_audit,
+        "norm_audit_sha256": sha256_file(norm_audit_path),
         "labels_or_returns_loaded": False,
     }
     _atomic_json(root / "moments" / "manifest.json", stage_manifest)

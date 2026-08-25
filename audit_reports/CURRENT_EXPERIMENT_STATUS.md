@@ -11,7 +11,8 @@ state that has only been reported through the running notebook.
 
 - Repository: `https://github.com/Russ4ever/chinese-wwm-roberta`
 - Branch at the time of this update: `main`
-- Pipeline commit: `9974fa2` (`new_pipeline`), also observed at `origin/main`
+- Repository HEAD before the current uncommitted activation-rank fix: `56eaf9e`
+  (`headcheck`), also observed at `origin/main`.
 - Mac checkout: `/Users/fanjingqi/Documents/ChatGPT/Chinese-wwm-roberta`
 - Remote-server checkout: `/home/intern_fjq_2026/Projects/chinese-wwm-roberta`
 - Active notebook on the server:
@@ -115,52 +116,63 @@ state that has only been reported through the running notebook.
 
 ## Label-free checkpoint activation-rank extension
 
-- On 2026-08-25 the independent extension `checkpoint_activation_rank_v1` was
-  implemented at:
-  - `configs/activation_rank.yaml`
-  - `notebooks/activation_rank_pipeline.ipynb`
-  - `src/activation_rank.py`
-  - `tests/test_activation_rank.py`
-- This extension does not read any label, return, exposure, or split artifact
-  and does not alter the continuous-label Layer Probe mainline or the static
-  alternative. Its scope is descriptive activation geometry of the current
-  frozen checkpoint on the canonical financial-report text distribution.
-- One backbone forward captures 49 sites: residual streams 0 through 12 and,
-  for each Transformer block, concatenated attention-head output `Z`, the
-  pre-residual attention output projection, and the pre-residual MLP dense
-  write. Ordinary tokens exclude tokenizer-marked special/PAD tokens; CLS is
-  accumulated separately. Attention matrices are never requested.
-- The implementation uses FP64 centered Chan/Welford moments, a 500k-token
-  precision/throughput pilot, stable eight-shard sampling, 0.5m/1m/2m/5m/10m
-  global token checkpoints, 5-sigma pilot-frozen filtering, paired shard
-  bootstrap evidence rules, full FP64 eigendecomposition, active-subspace
-  storage, and the `Sigma_O = W^O Sigma_Z (W^O)^T` mechanism audit. It stores no
-  raw token activations.
-- Long-run execution is resumable and fingerprint-gated. Sample, pilot,
-  primary shard, auxiliary stream, analysis, mechanism, and final manifests
-  reject incompatible or incomplete artifacts. Public core files are hardlinks
-  to their canonical stage artifacts so the expected paths do not duplicate
-  large matrices on disk. The main rank stage reuses one loaded model across
-  all missing shard segments, length-buckets batches, prefetches one tokenized
-  batch, keeps moments/norm counters on GPU, and defaults only to physical GPU
-  1 after the live shared-server gate passes.
-- The notebook has exactly eight orchestration cells. Run All is idempotent;
-  after a kernel restart at a shard failure, the import/config cell and shard
-  cell are sufficient, while already validated shards are skipped.
-- Local validation is **94 passing tests**, including 15 activation-rank tests
-  for centered moment/SVD equivalence, shard merge, hook positions and values,
-  token/CLS/duplicate cohort routing, covariance identity, collapse/bootstrap
-  boundaries, precision and batch selection, deterministic sampling, atomic
-  publication, corrupted-fingerprint rejection, auxiliary retry idempotence,
-  and notebook structure/AST. Formatting, static-name checks, compilation, and
-  diff whitespace checks also pass.
-- This is code validation only. No real checkpoint pilot, 5-million-token scan,
-  10-million-token continuation, eigendecomposition, or mechanism result has
-  been run or confirmed locally or on the remote server. The expected run path
-  is `artifacts/checkpoint_activation_rank/runs/financial_reports_v1`; no
-  manifest from that path may be treated as complete until synchronized and
-  hash-validated. Physical GPU 1 availability and current remote disk state
-  remain unconfirmed.
+- The independent activation-rank extension is implemented at
+  `configs/activation_rank.yaml`, `notebooks/activation_rank_pipeline.ipynb`,
+  `src/activation_rank.py`, and `tests/test_activation_rank.py`. It does not read
+  label, return, exposure, or split artifacts and remains separate from the
+  continuous-label Layer Probe mainline.
+- One frozen-backbone forward captures 49 sites: residual streams 0 through 12
+  and, for each Transformer block, concatenated attention-head output `Z`, the
+  pre-residual attention output projection, and the pre-residual MLP write.
+  Ordinary tokens exclude tokenizer-marked special/PAD positions; CLS is
+  accumulated separately. Attention matrices and raw token activations are not
+  stored.
+- The v1 remote attempt completed notebook cells 1-4 and the eight 5-million-
+  token shard targets. Its 502,928-token pilot used 1,410 reports, selected batch
+  size 512 and FP16, rejected BF16, and found that FP16 met the spectral
+  agreement criteria against FP32. Cell 5 then stopped at the pooled norm audit:
+  maximum mean shift 0.0105536, relative norm-standard-deviation shift 21531.89,
+  and filtered fraction 0.317864. Cells 6-8 did not run, and no valid v1 rank
+  conclusion exists.
+- The v1 failure was a protocol defect rather than evidence of activation drift
+  or dimensional collapse. The pilot had saved FP32 5-sigma norm thresholds
+  while the main scan used FP16; near-constant LayerNorm norms were quantized
+  differently. The old standard-deviation ratio also divided by an almost-zero
+  FP32 standard deviation, and the 1,410-sample CLS pilot was too small for a
+  universal blocking 1% standard-deviation gate.
+- On 2026-08-25 the protocol was corrected and versioned as
+  `checkpoint_activation_rank_v2.0`, with default run directory
+  `artifacts/checkpoint_activation_rank/runs/financial_reports_v2`. FP32 remains
+  the spectral-accuracy reference, but 5-sigma norm statistics and thresholds
+  now come from the selected main-scan dtype. The selected dtype, threshold
+  files, audit policy, and code/config fingerprints all enter the execution
+  identity, so incompatible pilot or shard state cannot be reused.
+- V2 preserves the v1 hash seed only to keep text ordering and shard assignment
+  comparable. Its v2 schema and run directory force a fresh sample manifest,
+  pilot, moments, analysis, and mechanism run. V1 files are not required for
+  v2 execution; the user plans to remove the failed v1 remote directory
+  manually for disk space. The historical failure remains documented here.
+- The blocking norm audit now applies to ordinary tokens only. CLS filtering is
+  reported as a non-blocking diagnostic, and both filtered and unfiltered CLS
+  moments are stored so the effect can be measured directly. Near-zero norm
+  standard deviations use a scale floor of
+  `compute_dtype_epsilon * abs(pilot_mean)` instead of an unstable near-zero
+  denominator. Both the 5-million checkpoint and final stage write a 98-row
+  per-population/per-site audit table with exact failures and maxima.
+- The notebook still has exactly eight idempotent orchestration cells. Old
+  remote outputs were cleared. If a genuine v2 norm audit fails, Cell 5 displays
+  the saved per-site table before re-raising, and completed fingerprint-matching
+  shards remain resumable.
+- Local validation after the v2 fix is **96 passing tests**, including 17
+  activation-rank tests. New regression coverage verifies selected-dtype norm
+  calibration, scale-aware near-constant norms, ordinary-token blocking,
+  non-blocking CLS warnings, unfiltered CLS routing, and the isolated v2 run
+  path. Black formatting, Python compilation, notebook AST/structure, and diff
+  whitespace checks pass.
+- No real v2 pilot or main scan has been run or synchronized locally. Do not
+  interpret v1 shard moments, and do not claim the activation-rank experiment is
+  complete until the v2 remote manifests and result tables have been copied
+  back and hash-validated.
 
 ## Confirmed label state
 
@@ -293,5 +305,6 @@ start a second Stage 1 job while the first server kernel is still running.
 - This statement is code validation only, not evidence that the current
   full-data server experiment completed successfully.
 - The label-free activation-rank implementation added on 2026-08-25 raises the
-  full local suite to 94 passing tests. Its real pilot and main scan have not
-  been executed or verified.
+  full local suite to 94 passing tests. Its later remote pilot passed, while
+  the 5-million-token scan stopped at the flawed pooled norm gate described
+  above; no rank/mechanism result is complete or interpretable.

@@ -256,8 +256,22 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
         eigvecs = sub[f"{prefix}__eigenvectors"]   # [768, 768]
         mean = sub[f"{prefix}__mean"]              # [768]
 
-        layer_idx = int(site.split("_")[-1]) - 1  # 0-indexed
-        target_module = bert.encoder.layer[layer_idx].attention.output.dense
+        # 根据 site 类型确定 hook 目标模块 (与 BertActivationHooks 一致)
+        site_type = site.rsplit("_", 1)[0]   # attention_output / mlp_output / residual / z
+        layer_num = int(site.rsplit("_", 1)[1])
+        layer_idx = layer_num - 1             # 0-indexed
+        if site_type == "attention_output":
+            target_module = bert.encoder.layer[layer_idx].attention.output.dense
+        elif site_type == "mlp_output":
+            target_module = bert.encoder.layer[layer_idx].output.dense
+        elif site_type == "residual" and layer_num > 0:
+            target_module = bert.encoder.layer[layer_idx]
+        elif site_type == "residual" and layer_num == 0:
+            target_module = bert.embeddings
+        elif site_type == "z":
+            target_module = bert.encoder.layer[layer_idx].attention.self
+        else:
+            raise ValueError(f"未知 site 类型: {site_type}")
 
         for n in n_list:
             if n == 0:
@@ -342,14 +356,12 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
     # --- 关键数值 ---
     print(f"\n损失恢复关键数值 (Layer {TARGET_LAYER}):")
     for label in experiment_sites:
-        sub_r = recovery_df[recovery_df["activation_type"] == label].set_index("n_components")
-        kl0 = sub_r.loc[0, "kl_divergence"]
-        for n in (0, 64, 128, 256, 384, 768):
-            f = sub_r.loc[n, "fraction_recovered"]
-            print(f"  {label:20s} N={n:3d}: KL={sub_r.loc[n, 'kl_divergence']:.6f}  recovered={f:.1%}")
-        # 找到 99% 恢复需要的维度数
-        n_99 = int(sub_r[sub_r["fraction_recovered"] >= 0.99]["n_components"].min())
-        print(f"  → 99% 恢复需要 {n_99}/{sub_r.loc[768, 'n_components']} 维 ({100*n_99/768:.1f}%)")
+        sub_r = recovery_df[recovery_df["activation_type"] == label].sort_values("n_components")
+        for _, row in sub_r[sub_r["n_components"].isin((0, 64, 128, 256, 384, 768))].iterrows():
+            print(f"  {label:20s} N={int(row['n_components']):3d}: KL={row['kl_divergence']:.6f}  recovered={row['fraction_recovered']:.1%}")
+        n_99_rows = sub_r[sub_r["fraction_recovered"] >= 0.99]
+        n_99 = int(n_99_rows["n_components"].min()) if len(n_99_rows) > 0 else 768
+        print(f"  -> 99% 恢复需要 {n_99}/768 维 ({100*n_99/768:.1f}%)")
 
     return recovery_df
 

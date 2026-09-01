@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 # ---------------------------------------------------------------------------
 # 路径与配置
@@ -186,7 +187,6 @@ def make_projection_hook(eigenvectors: np.ndarray, mean: np.ndarray,
 
 def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT) -> pd.DataFrame:
     """激活消融 → SVD 分量逐步恢复 → 下游损失恢复曲线。"""
-    import torch
     import torch.nn.functional as F
     from transformers import BertTokenizerFast
     from src.models.modeling import build_candidate

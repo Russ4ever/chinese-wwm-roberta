@@ -513,7 +513,7 @@ def validate_label_factor_return_outputs(directory: str | Path) -> dict[str, obj
     layer_sets = summary.groupby(["task_id", "horizon"])["layer"].agg(set)
     if not layer_sets.map(lambda values: values == set(range(13))).all():
         raise ValueError("Label股票日收益部分任务没有完整13层")
-    diagnostic = pd.read_csv(required[5])
+    diagnostic = pd.read_csv(root / "realized_label_return_diagnostic.csv")
     if not diagnostic["tradable_factor"].astype(str).str.lower().eq("false").all():
         raise ValueError("真实Label收益诊断被错误标记为可交易")
     return {

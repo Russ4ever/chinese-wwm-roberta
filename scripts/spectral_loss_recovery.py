@@ -270,46 +270,53 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
         loss_original = masked_lm_loss()
 
     # --- 消融实验 ---
+    # BERT 残差连接冗余度高, 单消融中间层 attention output 对 MLM 损失影响≈0
+    # (CE 1.0542 -> 1.0558, 分母为噪声级), 因此 attention/MLP 采用全部 12 层联合消融;
+    # residual stream 保持论文的单位置消融 (layer 6), 其分母天然健康。
     sub = np.load(ANALYSIS_DIR / "subspaces.npz", allow_pickle=False)
     experiment_sites = {
-        "Attention Output": "attention_output_06",
-        "Residual Stream": "residual_06",
+        "Attention Output": [f"attention_output_{i:02d}" for i in range(1, 13)],
+        "MLP Output": [f"mlp_output_{i:02d}" for i in range(1, 13)],
+        "Residual Stream": ["residual_06"],
     }
-    n_list = [0, 1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 640, 768]
+    n_list = [0, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 736, 768]
 
     all_results = []
-    for label, site in experiment_sites.items():
-        print(f"\n  [{label}] site={site}")
-        prefix = f"{STREAM}__{site}"
-        eigvecs = sub[f"{prefix}__eigenvectors"]   # [768, 768]
-        target_module = _resolve_target_module(bert, site)
+    for label, site_list in experiment_sites.items():
+        print(f"\n  [{label}] sites={site_list[0]}..{site_list[-1]} ({len(site_list)}个)")
+
+        # 每个 site 用各自层的主成分矩阵
+        module_eigvecs = []
+        for site in site_list:
+            prefix = f"{STREAM}__{site}"
+            eigvecs = sub[f"{prefix}__eigenvectors"]   # [768, 768]
+            module_eigvecs.append((_resolve_target_module(bert, site), eigvecs))
 
         for n in n_list:
             desc = "zero-ablation (=0 components)" if n == 0 else (
-                "full (no modification)" if n >= 768 else f"top-{n} SVD projection")
+                "full (no modification)" if n >= 768 else f"top-{n} SVD projection/layer")
 
-            if n >= 768:
-                handle = None
-            else:
+            handles = []
+            if n < 768:
                 # n=0 时 P=0, 输出全零 —— 与零消融严格一致
-                handle = target_module.register_forward_hook(
-                    make_projection_hook(eigvecs, n, device))
+                for target_module, eigvecs in module_eigvecs:
+                    handles.append(target_module.register_forward_hook(
+                        make_projection_hook(eigvecs, n, device)))
 
             with torch.inference_mode():
                 loss_n = masked_lm_loss()
 
-            if handle is not None:
+            for handle in handles:
                 handle.remove()
 
             all_results.append({
                 "activation_type": label,
-                "site": site,
-                "layer": TARGET_LAYER,
+                "n_sites": len(site_list),
                 "n_components": n,
                 "ce_loss": round(loss_n, 6),
                 "description": desc,
             })
-            if n in (0, 64, 128, 256, 384, 768):
+            if n in (0, 64, 128, 256, 384, 512, 768):
                 print(f"    N={n:3d}: CE={loss_n:.6f}")
 
     results_df = pd.DataFrame(all_results)
@@ -344,9 +351,9 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
         ax.plot(sub_r["n_components"], sub_r["fraction_recovered"], "o-",
                 label=label, linewidth=2, markersize=6)
     ax.axhline(y=0.99, color="gray", linestyle="--", alpha=0.5, label="99% recovered")
-    ax.set_xlabel("Number of Components Retained", fontsize=12)
+    ax.set_xlabel("Number of Components Retained (per site)", fontsize=12)
     ax.set_ylabel("Fraction of Loss Recovered", fontsize=12)
-    ax.set_title(f"Downstream MLM Loss Recovery (Layer {TARGET_LAYER})", fontsize=13)
+    ax.set_title("Downstream MLM Loss Recovery (Attention/MLP: L1-12 joint; Residual: L6)", fontsize=12)
     ax.legend(fontsize=11)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlim(-10, 780)

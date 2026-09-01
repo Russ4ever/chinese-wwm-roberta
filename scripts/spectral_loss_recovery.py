@@ -157,61 +157,68 @@ def path_c_spectral_analysis() -> pd.DataFrame:
 
 # ---------------------------------------------------------------------------
 # Path A: 激活消融与损失恢复 (Figure 3b)
+# 与论文公式严格一致:
+#   - 下游损失 = MLM 交叉熵 (微调backbone + base MLM head), 对应论文的 language model loss
+#   - 投影作用于原始激活 (不做均值中心化), N=0 严格等价于零消融, 曲线起点必为 0%
+#   - fraction = (loss_zero - loss_N) / (loss_zero - loss_original)
 # ---------------------------------------------------------------------------
-def make_zero_hook():
-    """零消融 hook: 把模块输出替换为全零。"""
-    def hook(_module, _inputs, output):
-        t = output[0] if isinstance(output, (tuple, list)) else output
-        result = torch.zeros_like(t)
-        if isinstance(output, (tuple, list)):
-            return (result,) + tuple(output[1:])
-        return result
-    return hook
+def make_projection_hook(eigenvectors: np.ndarray, n_components: int, device: str):
+    """SVD 投影 hook: 把输出替换为其在前 n 个主成分子空间上的投影 (原始激活, 不中心化)。
 
-
-def make_projection_hook(eigenvectors: np.ndarray, mean: np.ndarray,
-                         n_components: int, device: str):
-    """SVD 投影 hook: 把输出投影到前 n 个主成分子空间。"""
+    n_components=0 时投影矩阵为零矩阵, 输出被替换为全零 —— 与零消融严格等价,
+    因此恢复曲线从 N=0 的 0% 出发, 单调趋向 N=768 的 100%。
+    """
     V_n = torch.from_numpy(eigenvectors[:, :n_components]).to(device).float()   # [H, n]
-    mean_t = torch.from_numpy(mean).to(device).float()                          # [H]
     P = V_n @ V_n.T                                                            # [H, H]
 
     def hook(_module, _inputs, output):
         t = output[0] if isinstance(output, (tuple, list)) else output
-        result = ((t.float() - mean_t) @ P + mean_t).to(t.dtype)
+        result = (t.float() @ P).to(t.dtype)
         if isinstance(output, (tuple, list)):
             return (result,) + tuple(output[1:])
         return result
     return hook
 
 
+def _resolve_target_module(bert, site: str):
+    """site 名 -> hook 目标模块 (与 BertActivationHooks 的注册点一致)。"""
+    site_type = site.rsplit("_", 1)[0]
+    layer_num = int(site.rsplit("_", 1)[1])
+    layer_idx = layer_num - 1  # 0-indexed
+    if site_type == "attention_output":
+        return bert.encoder.layer[layer_idx].attention.output.dense
+    if site_type == "mlp_output":
+        return bert.encoder.layer[layer_idx].output.dense
+    if site_type == "residual" and layer_num > 0:
+        return bert.encoder.layer[layer_idx]
+    if site_type == "residual" and layer_num == 0:
+        return bert.embeddings
+    if site_type == "z":
+        return bert.encoder.layer[layer_idx].attention.self
+    raise ValueError(f"未知 site 类型: {site_type}")
+
+
 def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT) -> pd.DataFrame:
-    """激活消融 → SVD 分量逐步恢复 → 下游损失恢复曲线。"""
+    """激活消融 → SVD 分量逐步恢复 → 下游 MLM 损失恢复曲线。"""
     import torch.nn.functional as F
-    from transformers import BertTokenizerFast
-    from src.models.modeling import build_candidate
-    from src.layer_probe_representations import freeze_and_validate_inference_model
+    from transformers import BertTokenizerFast, BertForMaskedLM
+    from src.models.checkpoint import load_state_dict_safe, strip_prefix
 
     print("\n" + "=" * 60)
-    print("Path A: 激活消融与损失恢复")
+    print("Path A: 激活消融与损失恢复 (MLM CE, 论文公式)")
     print("=" * 60)
 
-    # --- 加载模型 ---
-    print("加载模型...")
-    candidate = build_candidate(
-        base_model_dir=str(ROOT / CONFIG["model"]["base_model_dir"]),
-        checkpoint_path=str(ROOT / CONFIG["model"]["checkpoint"]),
-        device=device,
-        dtype=torch.float16,
-    )
-    freeze_and_validate_inference_model(candidate, expected_hidden_layers=13)
-    candidate.eval()
-    bert = candidate.bert
+    # --- 加载模型: 微调 backbone + base MLM head ---
+    print("加载模型 (微调backbone + base MLM head)...")
+    base_dir = str(ROOT / CONFIG["model"]["base_model_dir"])
+    mlm = BertForMaskedLM.from_pretrained(base_dir)
+    state = strip_prefix(load_state_dict_safe(str(ROOT / CONFIG["model"]["checkpoint"]), map_location="cpu"))
+    bert_state = {k[len("bert."):]: v for k, v in state.items() if k.startswith("bert.")}
+    mlm.bert.load_state_dict(bert_state, strict=True)
+    mlm = mlm.to(device=device, dtype=torch.float16).eval()
+    bert = mlm.bert
 
-    # --- 加载 tokenizer ---
-    tokenizer = BertTokenizerFast.from_pretrained(
-        str(ROOT / CONFIG["model"]["base_model_dir"]), local_files_only=True
-    )
+    tokenizer = BertTokenizerFast.from_pretrained(base_dir, local_files_only=True)
 
     # --- 加载文本 ---
     print("加载文本...")
@@ -227,19 +234,38 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
     texts = merged["text"].dropna().tolist()[:n_texts]
     print(f"  使用 {len(texts)} 条文本")
 
-    # --- 分词 ---
+    # --- 分词 + 固定 mask (所有条件共用同一mask, 保证可比) ---
     encoded = tokenizer(
         texts, padding=True, truncation=True, max_length=512,
         return_tensors="pt", return_token_type_ids=True,
     )
     encoded = {k: v.to(device) for k, v in encoded.items()}
 
-    # --- 基线: 正常前向 ---
+    generator = torch.Generator(device=device).manual_seed(20260901)
+    special = (
+        (encoded["input_ids"] == tokenizer.cls_token_id)
+        | (encoded["input_ids"] == tokenizer.sep_token_id)
+        | (encoded["input_ids"] == tokenizer.pad_token_id)
+    )
+    prob = torch.rand(encoded["input_ids"].shape, device=device, generator=generator)
+    mask_positions = (prob < 0.15) & ~special
+    masked_ids = encoded["input_ids"].clone()
+    masked_ids[mask_positions] = tokenizer.mask_token_id
+    targets = encoded["input_ids"][mask_positions]
+    print(f"  mask token 数: {int(mask_positions.sum())}")
+
+    def masked_lm_loss() -> float:
+        """当前模型状态 (受hook影响) 下的 MLM 交叉熵。"""
+        out = mlm(input_ids=masked_ids,
+                  attention_mask=encoded["attention_mask"],
+                  token_type_ids=encoded["token_type_ids"])
+        logits = out.logits[mask_positions].float()
+        return F.cross_entropy(logits, targets).item()
+
+    # --- 基线损失 ---
     print("基线前向...")
     with torch.inference_mode():
-        out = candidate(**encoded)
-        baseline_logits = out.logits.float().cpu()
-    baseline_probs = F.softmax(baseline_logits, dim=-1)
+        loss_original = masked_lm_loss()
 
     # --- 消融实验 ---
     sub = np.load(ANALYSIS_DIR / "subspaces.npz", allow_pickle=False)
@@ -254,79 +280,53 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
         print(f"\n  [{label}] site={site}")
         prefix = f"{STREAM}__{site}"
         eigvecs = sub[f"{prefix}__eigenvectors"]   # [768, 768]
-        mean = sub[f"{prefix}__mean"]              # [768]
-
-        # 根据 site 类型确定 hook 目标模块 (与 BertActivationHooks 一致)
-        site_type = site.rsplit("_", 1)[0]   # attention_output / mlp_output / residual / z
-        layer_num = int(site.rsplit("_", 1)[1])
-        layer_idx = layer_num - 1             # 0-indexed
-        if site_type == "attention_output":
-            target_module = bert.encoder.layer[layer_idx].attention.output.dense
-        elif site_type == "mlp_output":
-            target_module = bert.encoder.layer[layer_idx].output.dense
-        elif site_type == "residual" and layer_num > 0:
-            target_module = bert.encoder.layer[layer_idx]
-        elif site_type == "residual" and layer_num == 0:
-            target_module = bert.embeddings
-        elif site_type == "z":
-            target_module = bert.encoder.layer[layer_idx].attention.self
-        else:
-            raise ValueError(f"未知 site 类型: {site_type}")
+        target_module = _resolve_target_module(bert, site)
 
         for n in n_list:
-            if n == 0:
-                hook_fn = make_zero_hook()
-                desc = "zero-ablation"
-            elif n >= 768:
-                hook_fn = None
-                desc = "full (no modification)"
-            else:
-                hook_fn = make_projection_hook(eigvecs, mean, n, device)
-                desc = f"top-{n} SVD projection"
+            desc = "zero-ablation (=0 components)" if n == 0 else (
+                "full (no modification)" if n >= 768 else f"top-{n} SVD projection")
 
-            handle = None
-            if hook_fn is not None:
-                handle = target_module.register_forward_hook(hook_fn)
+            if n >= 768:
+                handle = None
+            else:
+                # n=0 时 P=0, 输出全零 —— 与零消融严格一致
+                handle = target_module.register_forward_hook(
+                    make_projection_hook(eigvecs, n, device))
 
             with torch.inference_mode():
-                out = candidate(**encoded)
-                mod_logits = out.logits.float().cpu()
+                loss_n = masked_lm_loss()
 
             if handle is not None:
                 handle.remove()
-
-            mod_probs = F.softmax(mod_logits, dim=-1)
-            kl = F.kl_div(
-                torch.log(mod_probs + 1e-8), baseline_probs, reduction="sum"
-            ).item() / len(texts)
 
             all_results.append({
                 "activation_type": label,
                 "site": site,
                 "layer": TARGET_LAYER,
                 "n_components": n,
-                "kl_divergence": round(kl, 6),
+                "ce_loss": round(loss_n, 6),
                 "description": desc,
             })
             if n in (0, 64, 128, 256, 384, 768):
-                print(f"    N={n:3d} ({desc}): KL={kl:.6f}")
+                print(f"    N={n:3d}: CE={loss_n:.6f}")
 
     results_df = pd.DataFrame(all_results)
 
-    # --- 计算恢复比例 ---
+    # --- 恢复比例: (loss_zero - loss_N) / (loss_zero - loss_original) ---
     recovery = []
     for label in experiment_sites:
         sub_df = results_df[results_df["activation_type"] == label].set_index("n_components")
-        kl_zero = sub_df.loc[0, "kl_divergence"]
+        loss_zero = sub_df.loc[0, "ce_loss"]
+        denom = max(loss_zero - loss_original, 1e-8)
         for n in n_list:
-            kl_n = sub_df.loc[n, "kl_divergence"]
-            frac = 1.0 - kl_n / max(kl_zero, 1e-8)
+            loss_n = sub_df.loc[n, "ce_loss"]
             recovery.append({
                 "activation_type": label,
                 "n_components": n,
-                "kl_divergence": kl_n,
-                "kl_zero": kl_zero,
-                "fraction_recovered": round(frac, 6),
+                "ce_loss": loss_n,
+                "ce_zero": loss_zero,
+                "ce_original": round(loss_original, 6),
+                "fraction_recovered": round((loss_zero - loss_n) / denom, 6),
             })
     recovery_df = pd.DataFrame(recovery)
     recovery_df.to_parquet(ANALYSIS_DIR / "loss_recovery_metrics.parquet", index=False)
@@ -344,7 +344,7 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
     ax.axhline(y=0.99, color="gray", linestyle="--", alpha=0.5, label="99% recovered")
     ax.set_xlabel("Number of Components Retained", fontsize=12)
     ax.set_ylabel("Fraction of Loss Recovered", fontsize=12)
-    ax.set_title(f"Downstream Loss Recovery (Layer {TARGET_LAYER})", fontsize=13)
+    ax.set_title(f"Downstream MLM Loss Recovery (Layer {TARGET_LAYER})", fontsize=13)
     ax.legend(fontsize=11)
     ax.set_ylim(-0.05, 1.05)
     ax.set_xlim(-10, 780)
@@ -354,11 +354,11 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
     print(f"\n图已保存: {FIGURES_DIR / 'loss_recovery.png'}")
 
     # --- 关键数值 ---
-    print(f"\n损失恢复关键数值 (Layer {TARGET_LAYER}):")
+    print(f"\n损失恢复关键数值 (Layer {TARGET_LAYER}, loss_original={loss_original:.4f}):")
     for label in experiment_sites:
         sub_r = recovery_df[recovery_df["activation_type"] == label].sort_values("n_components")
         for _, row in sub_r[sub_r["n_components"].isin((0, 64, 128, 256, 384, 768))].iterrows():
-            print(f"  {label:20s} N={int(row['n_components']):3d}: KL={row['kl_divergence']:.6f}  recovered={row['fraction_recovered']:.1%}")
+            print(f"  {label:20s} N={int(row['n_components']):3d}: CE={row['ce_loss']:.4f}  recovered={row['fraction_recovered']:.1%}")
         n_99_rows = sub_r[sub_r["fraction_recovered"] >= 0.99]
         n_99 = int(n_99_rows["n_components"].min()) if len(n_99_rows) > 0 else 768
         print(f"  -> 99% 恢复需要 {n_99}/768 维 ({100*n_99/768:.1f}%)")

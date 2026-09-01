@@ -97,15 +97,23 @@ def build_cross_layer_factors(
     out = evaluation_predictions.copy()
     for column in LAYER_COLUMNS:
         out[f"single_{column}"] = out[column]
-    out["layer_consensus"] = evaluation_values.mean(axis=1)
-    out["layer_disagreement"] = evaluation_values.std(axis=1, ddof=0)
+    # Per-layer standardization fit on the historical reference sample and
+    # frozen-applied to evaluation, so consensus/disagreement/deep_minus_middle
+    # are not dominated by layers with larger prediction variance.  PCA and
+    # deep_residual already align scale on the reference sample.
+    consensus_scaler = StandardScaler().fit(reference_values)
+    evaluation_scaled = consensus_scaler.transform(evaluation_values)
+    middle_index = [int(layer) for layer in middle_layers]
+    deep_index = [int(layer) for layer in deep_layers]
+    out["layer_consensus"] = evaluation_scaled.mean(axis=1)
+    out["layer_disagreement"] = evaluation_scaled.std(axis=1, ddof=0)
+    out["deep_minus_middle"] = (
+        evaluation_scaled[:, deep_index].mean(axis=1)
+        - evaluation_scaled[:, middle_index].mean(axis=1)
+    )
     reference_middle = reference_predictions[middle].mean(axis=1).to_numpy(dtype=float)
     evaluation_middle = (
         evaluation_predictions[middle].mean(axis=1).to_numpy(dtype=float)
-    )
-    out["deep_minus_middle"] = (
-        evaluation_predictions[deep].mean(axis=1).to_numpy(dtype=float)
-        - evaluation_middle
     )
     deep_residual_model = LinearRegression().fit(
         reference_middle.reshape(-1, 1),
@@ -130,6 +138,8 @@ def build_cross_layer_factors(
         "reference_rows": len(reference_predictions),
         "middle_layers": [int(value) for value in middle_layers],
         "deep_layers": [int(value) for value in deep_layers],
+        "consensus_scaler_mean": consensus_scaler.mean_.tolist(),
+        "consensus_scaler_scale": consensus_scaler.scale_.tolist(),
         "deep_residual_intercept": float(deep_residual_model.intercept_),
         "deep_residual_coefficient": float(deep_residual_model.coef_[0]),
         "pca_explained_variance_ratio": pca.explained_variance_ratio_.tolist(),

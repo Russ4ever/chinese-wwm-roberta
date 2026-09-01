@@ -17,7 +17,12 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from .layer_probe_continuous import _atomic_write_once, _reuse_exact_output, _run_directory
-from .layer_probe_factors import benjamini_hochberg, newey_west_mean_test
+from .layer_probe_factors import (
+    benjamini_hochberg,
+    evaluate_incremental_ic,
+    evaluate_stratified_ic,
+    newey_west_mean_test,
+)
 from .layer_probe_models import daily_rank_ic, summarize_rank_ic
 from .layer_probe_panel import attach_forward_returns
 from .layer_probe_representations import protocol_config_hash, sha256_file
@@ -253,6 +258,93 @@ def _realized_label_diagnostic(
     return pd.DataFrame(records)
 
 
+def _incremental_ic_tables(
+    panel: pd.DataFrame,
+    *,
+    horizons: Sequence[int],
+    minimum_observations: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """控制 fixed_head_margin 与 log(n_texts) 后的日度 partial Rank IC。
+
+    回答"剥掉冻结头方向与研报覆盖度后，标签因子还剩多少截面 IC"。
+    """
+
+    daily_frames: list[pd.DataFrame] = []
+    summaries: list[dict[str, object]] = []
+    for (task_id, label_name, layer), factor in panel.groupby(
+        ["task_id", "label_name", "layer"], sort=True
+    ):
+        for horizon in horizons:
+            target = f"industry_adjusted_return_fut{int(horizon)}d"
+            summary, daily = evaluate_incremental_ic(
+                factor,
+                factors=["factor_value"],
+                target_column=target,
+                min_daily_observations=minimum_observations,
+                hac_lags=max(0, int(horizon) - 1),
+            )
+            daily = daily.copy()
+            daily.insert(0, "horizon", int(horizon))
+            daily.insert(0, "layer", int(layer))
+            daily.insert(0, "label_name", label_name)
+            daily.insert(0, "task_id", task_id)
+            daily_frames.append(daily)
+            row = summary.iloc[0].to_dict() if not summary.empty else {}
+            row.pop("factor", None)
+            row.pop("qvalue_bh", None)
+            summaries.append(
+                {
+                    "task_id": task_id,
+                    "label_name": label_name,
+                    "layer": int(layer),
+                    "horizon": int(horizon),
+                    **row,
+                }
+            )
+    summary_frame = pd.DataFrame(summaries)
+    if not summary_frame.empty and "hac_pvalue" in summary_frame.columns:
+        summary_frame["qvalue_bh"] = benjamini_hochberg(
+            summary_frame["hac_pvalue"]
+        )
+    daily_frame = (
+        pd.concat(daily_frames, ignore_index=True) if daily_frames else pd.DataFrame()
+    )
+    return daily_frame, summary_frame
+
+
+def _stratified_ic_tables(
+    panel: pd.DataFrame,
+    *,
+    horizons: Sequence[int],
+    minimum_observations: int,
+) -> pd.DataFrame:
+    """按 n_texts/年份/行业/规模分层的日度 Rank IC。"""
+
+    records: list[dict[str, object]] = []
+    for (task_id, label_name, layer), factor in panel.groupby(
+        ["task_id", "label_name", "layer"], sort=True
+    ):
+        for horizon in horizons:
+            target = f"industry_adjusted_return_fut{int(horizon)}d"
+            stratified = evaluate_stratified_ic(
+                factor,
+                factors=["factor_value"],
+                target_column=target,
+                min_daily_observations=minimum_observations,
+            )
+            for _, row in stratified.iterrows():
+                records.append(
+                    {
+                        "task_id": task_id,
+                        "label_name": label_name,
+                        "layer": int(layer),
+                        "horizon": int(horizon),
+                        **row.to_dict(),
+                    }
+                )
+    return pd.DataFrame(records)
+
+
 def run_label_factor_return_stage(config: Mapping[str, object]) -> Path:
     """Evaluate validation OOS label-prediction factors on future returns."""
 
@@ -297,6 +389,41 @@ def run_label_factor_return_stage(config: Mapping[str, object]) -> Path:
     )
     minimum_observations = int(factor_cfg.get("min_daily_observations", 20))
     quantiles = int(factor_cfg.get("quantiles", 5))
+    # 把 canonical 股票日 groups 的 n_texts 与 fixed_head_margin 并入标签面板，
+    # 供增量/分层 IC 剥离冻结头方向与研报覆盖度混淆。groups 由 Stage 3
+    # (run_stock_day_panel_stage) 产出；若缺失则降级为空表并记 manifest。
+    groups_path = run / "stock_day_panel" / "stock_day_groups.parquet"
+    if groups_path.is_file():
+        groups = pd.read_parquet(
+            groups_path,
+            columns=["trading_date", "symbol", "n_texts", "fixed_head_margin"],
+        )
+        groups["symbol"] = canonical_stock_code(groups["symbol"])
+        groups["trading_date"] = pd.to_datetime(
+            groups["trading_date"], errors="coerce"
+        ).dt.normalize()
+        stock_day = stock_day.merge(
+            groups,
+            on=["trading_date", "symbol"],
+            how="left",
+            validate="many_to_one",
+        )
+        incremental_ic, incremental_daily_ic = _incremental_ic_tables(
+            stock_day,
+            horizons=horizons,
+            minimum_observations=minimum_observations,
+        )
+        stratified_ic = _stratified_ic_tables(
+            stock_day,
+            horizons=horizons,
+            minimum_observations=minimum_observations,
+        )
+        incremental_status = "computed"
+    else:
+        incremental_ic = pd.DataFrame()
+        incremental_daily_ic = pd.DataFrame()
+        stratified_ic = pd.DataFrame()
+        incremental_status = "skipped_stock_day_groups_missing"
     daily_ic, summary = _factor_ic_tables(
         stock_day,
         horizons=horizons,
@@ -331,6 +458,9 @@ def run_label_factor_return_stage(config: Mapping[str, object]) -> Path:
             "label_factor_stock_day.parquet": stock_day,
             "label_factor_daily_ic.parquet": daily_ic,
             "label_factor_summary.csv": summary,
+            "label_factor_incremental_ic.csv": incremental_ic,
+            "label_factor_incremental_daily_ic.parquet": incremental_daily_ic,
+            "label_factor_stratified_ic.csv": stratified_ic,
             "label_factor_quantile_returns.parquet": quantile_daily,
             "label_factor_quantile_summary.csv": quantile_summary,
             "realized_label_return_diagnostic.csv": realized_diagnostic,
@@ -345,6 +475,9 @@ def run_label_factor_return_stage(config: Mapping[str, object]) -> Path:
             "horizons": horizons,
             "primary_horizon": primary_horizon,
             "minimum_daily_observations": minimum_observations,
+            "incremental_ic_status": incremental_status,
+            "incremental_ic_controls": "fixed_head_margin, log_n_texts",
+            "stratified_ic_dimensions": "n_texts_group, year, industry, size",
             "realized_label_diagnostic": "non-tradable look-ahead diagnostic only",
             "returns_source": str(returns_path),
         },
@@ -357,6 +490,9 @@ def validate_label_factor_return_outputs(directory: str | Path) -> dict[str, obj
         root / "label_factor_stock_day.parquet",
         root / "label_factor_daily_ic.parquet",
         root / "label_factor_summary.csv",
+        root / "label_factor_incremental_ic.csv",
+        root / "label_factor_incremental_daily_ic.parquet",
+        root / "label_factor_stratified_ic.csv",
         root / "label_factor_quantile_returns.parquet",
         root / "label_factor_quantile_summary.csv",
         root / "realized_label_return_diagnostic.csv",

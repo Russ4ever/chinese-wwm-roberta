@@ -93,33 +93,34 @@ for label, prefix in sites.items():
     print(f'  {label:20s}: dirs>1%={n_above_1pct}/{dim} ({100*n_above_1pct/dim:.1f}%), '
           f'99% var in {n_99}/{dim} ({100*n_99/dim:.1f}%)')'''
 
-CELL_10_SOURCE = r'''# 10. 激活消融与损失恢复 — 复现论文 Figure 3b
-# 零消融 → SVD 分量逐步恢复 → 下游 KL 恢复曲线
+CELL_10_SOURCE = r'''# 10. 激活消融与损失恢复 — 复现论文 Figure 3b (MLM CE, 论文公式)
+# 与论文严格一致: 下游损失 = MLM 交叉熵; 投影作用于原始激活 (N=0 == 零消融)
+# fraction = (loss_zero - loss_N) / (loss_zero - loss_original)
+# BERT 残差连接冗余度高, 单层 attention 消融对 MLM 损失影响≈0, 故 attention/MLP
+# 采用 12 层联合消融; residual stream 保持 layer 6 单层消融 (分母天然健康)。
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import BertTokenizerFast
-from src.models.modeling import build_candidate
-from src.layer_probe_representations import freeze_and_validate_inference_model
+from pathlib import Path
+from transformers import BertTokenizerFast, BertForMaskedLM
+from src.models.checkpoint import load_state_dict_safe, strip_prefix
 
 device = 'cuda:0'
-compute_dtype = torch.float16
 
-# 加载模型
-candidate = build_candidate(
-    base_model_dir=str(ROOT / config['model']['base_model_dir']),
-    checkpoint_path=str(ROOT / config['model']['checkpoint']),
-    device=device, dtype=compute_dtype,
-)
-freeze_and_validate_inference_model(candidate, expected_hidden_layers=13)
-candidate.eval()
-bert = candidate.bert
+# 加载模型: 微调 backbone + base MLM head
+base_dir = str(ROOT / config['model']['base_model_dir'])
+mlm = BertForMaskedLM.from_pretrained(base_dir)
+state = strip_prefix(load_state_dict_safe(str(ROOT / config['model']['checkpoint']), map_location='cpu'))
+bert_state = {k[len('bert.'):]: v for k, v in state.items()
+              if k.startswith('bert.') and not k.startswith('bert.pooler.')}
+mlm.bert.load_state_dict(bert_state, strict=True)
+mlm = mlm.to(device=device, dtype=torch.float16).eval()
+bert = mlm.bert
 
-tokenizer = BertTokenizerFast.from_pretrained(
-    str(ROOT / config['model']['base_model_dir']), local_files_only=True)
+tokenizer = BertTokenizerFast.from_pretrained(base_dir, local_files_only=True)
 
-# 加载 500 条文本
-sample = pd.read_parquet(completed_dir / 'sample' / 'sample_manifest.parquet')
+# 加载 500 条文本 (用 RUN_DIR, 不依赖 cell 8 的 completed_dir)
+sample = pd.read_parquet(RUN_DIR / 'sample' / 'sample_manifest.parquet')
 reports_path = Path(str(config['text']['path']))
 if not reports_path.is_absolute():
     reports_path = ROOT / reports_path
@@ -134,94 +135,113 @@ encoded = tokenizer(texts, padding=True, truncation=True, max_length=512,
                      return_tensors='pt', return_token_type_ids=True)
 encoded = {k: v.to(device) for k, v in encoded.items()}
 
-# 基线前向
+# 固定 mask (所有条件共用, 保证可比)
+generator = torch.Generator(device=device).manual_seed(20260901)
+special = ((encoded['input_ids'] == tokenizer.cls_token_id)
+           | (encoded['input_ids'] == tokenizer.sep_token_id)
+           | (encoded['input_ids'] == tokenizer.pad_token_id))
+prob = torch.rand(encoded['input_ids'].shape, device=device, generator=generator)
+mask_positions = (prob < 0.15) & ~special
+masked_ids = encoded['input_ids'].clone()
+masked_ids[mask_positions] = tokenizer.mask_token_id
+targets = encoded['input_ids'][mask_positions]
+
+def masked_lm_loss():
+    out = mlm(input_ids=masked_ids, attention_mask=encoded['attention_mask'],
+              token_type_ids=encoded['token_type_ids'])
+    logits = out.logits[mask_positions].float()
+    return F.cross_entropy(logits, targets).item()
+
 with torch.inference_mode():
-    out = candidate(**encoded)
-    baseline_logits = out.logits.float().cpu()
-baseline_probs = F.softmax(baseline_logits, dim=-1)
+    loss_original = masked_lm_loss()
 
-# hook 工厂
-def make_zero_hook():
-    def hook(_module, _inputs, output):
-        t = output[0] if isinstance(output, (tuple, list)) else output
-        result = torch.zeros_like(t)
-        return (result,) + tuple(output[1:]) if isinstance(output, (tuple, list)) else result
-    return hook
-
-def make_projection_hook(eigvecs, mean, n, device):
+# hook: 非中心化投影, n=0 时 P=0 -> 全零 (零消融)
+def make_projection_hook(eigvecs, n):
     V_n = torch.from_numpy(eigvecs[:, :n]).to(device).float()
-    mean_t = torch.from_numpy(mean).to(device).float()
     P = V_n @ V_n.T
-    def hook(_module, _inputs, output):
+    def hook(_m, _i, output):
         t = output[0] if isinstance(output, (tuple, list)) else output
-        result = ((t.float() - mean_t) @ P + mean_t).to(t.dtype)
+        result = (t.float() @ P).to(t.dtype)
         return (result,) + tuple(output[1:]) if isinstance(output, (tuple, list)) else result
     return hook
 
-# 消融实验
-sub = subspaces
-experiment_sites = {'Attention Output': 'attention_output_06', 'Residual Stream': 'residual_06'}
-n_list = [0, 1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 640, 768]
-all_results = []
-
-for label, site in experiment_sites.items():
-    prefix = f'token_natural_filtered__{site}'
-    eigvecs = sub[f'{prefix}__eigenvectors']
-    mean = sub[f'{prefix}__mean']
+def resolve_target(site):
     site_type = site.rsplit('_', 1)[0]
     layer_num = int(site.rsplit('_', 1)[1])
     layer_idx = layer_num - 1
     if site_type == 'attention_output':
-        target = bert.encoder.layer[layer_idx].attention.output.dense
-    elif site_type == 'mlp_output':
-        target = bert.encoder.layer[layer_idx].output.dense
-    elif site_type == 'residual' and layer_num > 0:
-        target = bert.encoder.layer[layer_idx]
-    else:
-        target = bert.embeddings
+        return bert.encoder.layer[layer_idx].attention.output.dense
+    if site_type == 'mlp_output':
+        return bert.encoder.layer[layer_idx].output.dense
+    if site_type == 'residual' and layer_num > 0:
+        return bert.encoder.layer[layer_idx]
+    if site_type == 'residual' and layer_num == 0:
+        return bert.embeddings
+    if site_type == 'z':
+        return bert.encoder.layer[layer_idx].attention.self
+    raise ValueError(site)
+
+sub = subspaces
+experiment_sites = {
+    'Attention Output': [f'attention_output_{i:02d}' for i in range(1, 13)],
+    'MLP Output': [f'mlp_output_{i:02d}' for i in range(1, 13)],
+    'Residual Stream': ['residual_06'],
+}
+n_list = [0, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 736, 768]
+all_results = []
+
+for label, site_list in experiment_sites.items():
+    module_eigvecs = []
+    for site in site_list:
+        prefix = f'token_natural_filtered__{site}'
+        module_eigvecs.append((resolve_target(site), sub[f'{prefix}__eigenvectors']))
 
     for n in n_list:
-        if n == 0:
-            h = make_zero_hook()
-        elif n >= 768:
-            h = None
-        else:
-            h = make_projection_hook(eigvecs, mean, n, device)
-        handle = target.register_forward_hook(h) if h is not None else None
+        handles = []
+        if n < 768:
+            for target, eigvecs in module_eigvecs:
+                handles.append(target.register_forward_hook(make_projection_hook(eigvecs, n)))
         with torch.inference_mode():
-            out = candidate(**encoded)
-            mod_logits = out.logits.float().cpu()
-        if handle is not None:
-            handle.remove()
-        mod_probs = F.softmax(mod_logits, dim=-1)
-        kl = F.kl_div(torch.log(mod_probs + 1e-8), baseline_probs, reduction='sum').item() / len(texts)
-        all_results.append({'activation_type': label, 'n_components': n, 'kl_divergence': round(kl, 6)})
+            loss_n = masked_lm_loss()
+        for h in handles:
+            h.remove()
+        all_results.append({'activation_type': label, 'n_components': n, 'ce_loss': round(loss_n, 6)})
 
-recovery = pd.DataFrame(all_results)
-recovery['fraction_recovered'] = recovery.apply(
-    lambda r: round(1 - r['kl_divergence'] / max(
-        recovery[(recovery['activation_type'] == r['activation_type']) & (recovery['n_components'] == 0)]['kl_divergence'].values[0], 1e-8), 6), axis=1)
+results_df = pd.DataFrame(all_results)
+recovery = []
+for label in experiment_sites:
+    sub_df = results_df[results_df['activation_type'] == label].set_index('n_components')
+    loss_zero = sub_df.loc[0, 'ce_loss']
+    denom = max(loss_zero - loss_original, 1e-8)
+    for n in n_list:
+        loss_n = sub_df.loc[n, 'ce_loss']
+        recovery.append({
+            'activation_type': label, 'n_components': n, 'ce_loss': loss_n,
+            'fraction_recovered': round((loss_zero - loss_n) / denom, 6),
+        })
+recovery_df = pd.DataFrame(recovery)
 
 fig, ax = plt.subplots(figsize=(9, 5))
 for label in experiment_sites:
-    sub_r = recovery[recovery['activation_type'] == label].sort_values('n_components')
-    ax.plot(sub_r['n_components'], sub_r['fraction_recovered'], 'o-', label=label, linewidth=2, markersize=5)
+    sub_r = recovery_df[recovery_df['activation_type'] == label].sort_values('n_components')
+    ax.plot(sub_r['n_components'], sub_r['fraction_recovered'], 'o-',
+            label=label, linewidth=2, markersize=5)
 ax.axhline(y=0.99, color='gray', linestyle='--', alpha=0.5, label='99% recovered')
-ax.set_xlabel('Number of Components Retained', fontsize=12)
+ax.set_xlabel('Number of Components Retained (per site)', fontsize=12)
 ax.set_ylabel('Fraction of Loss Recovered', fontsize=12)
-ax.set_title(f'Downstream Loss Recovery (Layer 6)', fontsize=13)
+ax.set_title('Downstream MLM Loss Recovery (Attention/MLP: L1-12 joint; Residual: L6)', fontsize=12)
 ax.legend(fontsize=11)
 ax.set_ylim(-0.05, 1.05)
 ax.set_xlim(-10, 780)
 plt.tight_layout()
 plt.show()
 
-display(recovery[recovery['n_components'].isin([0, 64, 128, 256, 384, 768])].pivot(
+display(recovery_df[recovery_df['n_components'].isin([0, 64, 128, 256, 384, 512, 768])].pivot(
     index='n_components', columns='activation_type', values='fraction_recovered').round(3))
 
-print('\n99% 恢复所需维度:')
+print(f'\nloss_original={loss_original:.4f}  99% 恢复所需维度:')
 for label in experiment_sites:
-    sub_r = recovery[recovery['activation_type'] == label]
+    sub_r = recovery_df[recovery_df['activation_type'] == label]
     n99 = sub_r[sub_r['fraction_recovered'] >= 0.99]['n_components']
     n99 = int(n99.min()) if len(n99) > 0 else 768
     print(f'  {label}: {n99}/768 ({100*n99/768:.1f}%)')'''
@@ -259,8 +279,13 @@ def main():
     cell9 = make_cell_proper(CELL_9_SOURCE, "spectral-analysis")
     cell10 = make_cell_proper(CELL_10_SOURCE, "loss-recovery")
 
-    nb["cells"].append(cell9)
-    nb["cells"].append(cell10)
+    # 幂等: 已存在同 id 的 cell 则原位替换, 否则追加
+    existing = {c.get("id"): idx for idx, c in enumerate(nb["cells"])}
+    for cell in (cell9, cell10):
+        if cell["id"] in existing:
+            nb["cells"][existing[cell["id"]]] = cell
+        else:
+            nb["cells"].append(cell)
 
     with open(NB_PATH, "w", encoding="utf-8") as f:
         json.dump(nb, f, ensure_ascii=False, indent=1)

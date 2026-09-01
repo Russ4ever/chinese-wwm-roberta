@@ -689,6 +689,14 @@ def run_walk_forward_probe_stage(
                 y_evaluation = evaluation["label_value"].to_numpy(dtype=float)
                 w_train = train["target_weight"].to_numpy(dtype=float)
                 scaler = StandardScaler().fit(x_train, sample_weight=w_train)
+                # Guard against near-constant features (e.g. Layer-0 CLS
+                # embedding) whose weighted variance rounds to <=0 and yields
+                # a NaN scale; treat those features as constant (scale 1,
+                # mean 0) so Ridge stays finite instead of emitting NaN.
+                bad = ~np.isfinite(scaler.scale_) | (scaler.scale_ <= 0)
+                if bad.any():
+                    scaler.scale_ = np.where(bad, 1.0, scaler.scale_)
+                    scaler.mean_ = np.where(bad, 0.0, scaler.mean_)
                 x_train_scaled = scaler.transform(x_train)
                 x_evaluation_scaled = scaler.transform(x_evaluation)
                 predictions: dict[float, np.ndarray] = {}
@@ -704,6 +712,12 @@ def run_walk_forward_probe_stage(
                     score = _safe_correlation(
                         candidate, y_evaluation, kind="spearman"
                     )
+                    # A constant prediction (e.g. Layer-0 CLS embedding)
+                    # yields a non-finite rank correlation; treat it as zero
+                    # signal so the fold stays eligible instead of being
+                    # dropped, keeping all 13 layers in the output.
+                    if not np.isfinite(score):
+                        score = 0.0
                     tuning_records.append(
                         {
                             "task_id": task_id,

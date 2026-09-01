@@ -61,7 +61,7 @@ continuous_probe:
   enabled: true
   alpha_grid: [0.1, 1.0, 10.0, 100.0, 1000.0]
   selection_metric: mean_annual_validation_spearman
-  solver: lsqr
+  solver: cholesky
   tolerance: 1.0e-6
   maximum_iterations: 10000
 

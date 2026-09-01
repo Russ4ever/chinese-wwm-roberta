@@ -16,6 +16,7 @@ from src.layer_probe_representations import (
 from src.layer_probe_walk_forward import (
     align_walk_forward_targets,
     fold_masks,
+    merge_walk_forward_probe_shards,
     parse_walk_forward_protocol,
     run_walk_forward_fixed_head_stage,
     run_walk_forward_probe_stage,
@@ -167,7 +168,7 @@ class _ToyTokenizer:
         }
 
 
-def _walk_forward_artifacts(tmp_path: Path):
+def _walk_forward_artifacts(tmp_path: Path, task_ids=("residual_signed_raw__fh0",)):
     from blake3 import blake3
 
     rows_per_year = 8
@@ -225,22 +226,26 @@ def _walk_forward_artifacts(tmp_path: Path):
                 "blake3": digest.hexdigest(),
             }
         )
-    targets = pd.DataFrame(
-        {
-            "sample_id": [f"s{index:03d}" for index in range(n)],
-            "report_id": reports["report_id"],
-            "task_id": "residual_signed_raw__fh0",
-            "split": "unassigned",
-            "label_name": "residual_signed_raw",
-            "label_value": np.sin(np.arange(n)) + np.arange(n) / 10,
-            "target_weight": 1.0,
-            "feature_available_date": dates,
-            "label_available_date": dates + pd.Timedelta(days=120),
-            "forecast_horizon": 0,
-            "label_version": "toy-v1",
-            "stock_code": reports["symbol"],
-        }
-    )
+    target_rows = []
+    for task_index, task_id in enumerate(task_ids):
+        for index in range(n):
+            target_rows.append(
+                {
+                    "sample_id": f"s{task_index}_{index:03d}",
+                    "report_id": reports["report_id"].iloc[index],
+                    "task_id": task_id,
+                    "split": "unassigned",
+                    "label_name": task_id.rsplit("__", 1)[0],
+                    "label_value": float(np.sin(index) + index / 10 + task_index),
+                    "target_weight": 1.0,
+                    "feature_available_date": dates[index],
+                    "label_available_date": dates[index] + pd.Timedelta(days=120),
+                    "forecast_horizon": 0,
+                    "label_version": "toy-v1",
+                    "stock_code": reports["symbol"].iloc[index],
+                }
+            )
+    targets = pd.DataFrame(target_rows)
     targets.to_parquet(bundle / "probe_targets.parquet", index=False)
     (bundle / "probe_dataset_metadata.json").write_text(
         json.dumps(
@@ -288,3 +293,48 @@ def test_walk_forward_artifact_pipeline_never_loads_final_test(tmp_path: Path):
     predictions = pd.read_parquet(probe / "walk_forward_oos_predictions.parquet")
     assert pd.to_datetime(predictions["feature_available_date"]).max().year == 2022
     assert set(predictions["layer"]) == set(range(13))
+
+
+def test_walk_forward_probe_shard_merge_matches_sequential(tmp_path: Path):
+    import shutil
+
+    task_ids = ("residual_signed_raw__fh0", "residual_signed_raw__fh1")
+    config = _walk_forward_artifacts(tmp_path, task_ids=task_ids)
+    align_walk_forward_targets(config)
+
+    sequential = run_walk_forward_probe_stage(config)
+    seq_pred = pd.read_parquet(
+        sequential / "walk_forward_oos_predictions.parquet"
+    )
+    seq_sel = pd.read_csv(sequential / "walk_forward_selected_alphas.csv")
+
+    # Remove the canonical output so the sharded path writes a fresh merge.
+    shutil.rmtree(sequential)
+    run_walk_forward_probe_stage(config, task_ids=[task_ids[0]], shard_tag="a")
+    run_walk_forward_probe_stage(config, task_ids=[task_ids[1]], shard_tag="b")
+    merged = merge_walk_forward_probe_shards(config, ["a", "b"])
+    assert validate_walk_forward_probe_outputs(merged)["tasks"] == 2
+
+    merged_pred = pd.read_parquet(
+        merged / "walk_forward_oos_predictions.parquet"
+    )
+    merged_sel = pd.read_csv(merged / "walk_forward_selected_alphas.csv")
+
+    sort_cols = ["task_id", "layer", "sample_id"]
+    pd.testing.assert_frame_equal(
+        merged_pred.sort_values(sort_cols).reset_index(drop=True)[
+            ["task_id", "layer", "sample_id", "prediction"]
+        ].astype({"prediction": "float64"}),
+        seq_pred.sort_values(sort_cols).reset_index(drop=True)[
+            ["task_id", "layer", "sample_id", "prediction"]
+        ].astype({"prediction": "float64"}),
+        check_exact=False,
+        rtol=1e-5,
+    )
+    sel_cols = ["task_id", "layer", "selected_alpha", "mean_fold_spearman"]
+    pd.testing.assert_frame_equal(
+        merged_sel.sort_values(sel_cols).reset_index(drop=True)[sel_cols],
+        seq_sel.sort_values(sel_cols).reset_index(drop=True)[sel_cols],
+        check_exact=False,
+        rtol=1e-5,
+    )

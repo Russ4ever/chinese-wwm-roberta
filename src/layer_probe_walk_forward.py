@@ -565,8 +565,20 @@ def _positive_rows(frame: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
 
-def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
-    """Fit annual expanding StandardScaler+Ridge probes on validation folds."""
+def run_walk_forward_probe_stage(
+    config: Mapping[str, object],
+    *,
+    task_ids: Sequence[str] | None = None,
+    shard_tag: str | None = None,
+) -> Path:
+    """Fit annual expanding StandardScaler+Ridge probes on validation folds.
+
+    When ``task_ids``/``shard_tag`` are set the stage processes only those tasks
+    and writes a partial shard directory (``validation_shard_<shard_tag>``)
+    without the full coverage check; ``merge_walk_forward_probe_shards``
+    reassembles shards into the canonical ``validation`` directory so the
+    fingerprint matches a single-process run.
+    """
 
     protocol = parse_walk_forward_protocol(config)
     representations, _, _, rep_manifest, _ = _load_representation_bundle(config)
@@ -585,30 +597,45 @@ def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
     if tolerance <= 0 or maximum_iterations <= 0:
         raise ValueError("Ridge tolerance/maximum_iterations必须为正")
 
-    output = _run_directory(config) / "walk_forward_probe" / "validation"
+    sharded = shard_tag is not None
+    probe_root = _run_directory(config) / "walk_forward_probe"
+    output = probe_root / (f"validation_shard_{shard_tag}" if sharded else "validation")
     expected = {
         "schema_version": WALK_FORWARD_PROBE_SCHEMA,
         "representation_fingerprint": rep_manifest["representation_fingerprint"],
         "config_sha256": protocol_config_hash(config),
         "target_alignment_fingerprint": target_manifest["alignment_fingerprint"],
     }
-    if _reuse_exact_output(
+    # Reuse only applies to the canonical (full) output; shards are always
+    # recomputed so a partial shard is never mistaken for a complete one.
+    if not sharded and _reuse_exact_output(
         output,
         expected_manifest=expected,
         validator=validate_walk_forward_probe_outputs,
     ):
         return output
 
+    grouped = list(targets.groupby("task_id", sort=True))
+    if task_ids is not None:
+        wanted = {str(value) for value in task_ids}
+        grouped = [
+            (task_id, frame) for task_id, frame in grouped if str(task_id) in wanted
+        ]
+        missing = sorted(wanted.difference(str(task_id) for task_id, _ in grouped))
+        if missing:
+            raise ValueError("shard引用了不存在的task_id: " + ", ".join(missing))
     tuning_records: list[dict[str, object]] = []
     selection_records: list[dict[str, object]] = []
     metric_records: list[dict[str, object]] = []
     prediction_frames: list[pd.DataFrame] = []
     eligibility: list[dict[str, object]] = []
-    n_tasks = targets["task_id"].nunique()
-    for task_index, (task_id, raw_task) in enumerate(
-        targets.groupby("task_id", sort=True), start=1
-    ):
-        print(f"[stage6] task {task_index}/{n_tasks} {task_id}", flush=True)
+    n_tasks = len(grouped)
+    for task_index, (task_id, raw_task) in enumerate(grouped, start=1):
+        print(
+            f"[stage6{f'/{shard_tag}' if sharded else ''}] "
+            f"task {task_index}/{n_tasks} {task_id}",
+            flush=True,
+        )
         task = _positive_rows(raw_task)
         if task.empty:
             eligibility.append(
@@ -797,22 +824,28 @@ def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
             )
             prediction_frames.extend(selected_layer_predictions)
     if not prediction_frames:
+        if sharded:
+            raise ValueError(f"shard {shard_tag} 没有生成walk-forward OOS预测")
         raise ValueError("没有任务生成walk-forward OOS预测")
     predictions = pd.concat(prediction_frames, ignore_index=True)
     metrics = pd.DataFrame(metric_records)
     selections = pd.DataFrame(selection_records)
-    expected_tasks = set(targets["task_id"].astype(str).unique())
-    actual_tasks = set(selections["task_id"].astype(str).unique())
-    layer_sets = selections.groupby("task_id")["layer"].agg(set)
-    if actual_tasks != expected_tasks or not layer_sets.map(
-        lambda values: values == set(range(13))
-    ).all():
-        missing = sorted(expected_tasks.difference(actual_tasks))
-        raise ValueError(
-            "walk-forward probe未覆盖全部任务或13层: "
-            f"missing_tasks={missing}"
-        )
-    print("[stage6] writing walk_forward_probe/validation outputs", flush=True)
+    if not sharded:
+        expected_tasks = set(targets["task_id"].astype(str).unique())
+        actual_tasks = set(selections["task_id"].astype(str).unique())
+        layer_sets = selections.groupby("task_id")["layer"].agg(set)
+        if actual_tasks != expected_tasks or not layer_sets.map(
+            lambda values: values == set(range(13))
+        ).all():
+            missing = sorted(expected_tasks.difference(actual_tasks))
+            raise ValueError(
+                "walk-forward probe未覆盖全部任务或13层: "
+                f"missing_tasks={missing}"
+            )
+    print(
+        f"[stage6{f'/{shard_tag}' if sharded else ''}] writing {output.name} outputs",
+        flush=True,
+    )
     return _atomic_write_once(
         output,
         tables={
@@ -835,10 +868,90 @@ def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
             "sample_weight": "positive weights; used by StandardScaler and Ridge",
             "target_transform": "none",
             "final_test_rows_loaded": False,
+            "partial": sharded,
+            "shard_tag": shard_tag,
+            "shard_task_ids": (
+                [str(task_id) for task_id, _ in grouped] if sharded else None
+            ),
             "oos_contract": (
                 "for fold Y train feature<Y and label_available<Y; "
                 "evaluation outcomes known by selection cutoff"
             ),
+        },
+    )
+
+
+def merge_walk_forward_probe_shards(
+    config: Mapping[str, object], shard_tags: Sequence[str]
+) -> Path:
+    """Reassemble per-task shards into the canonical validation directory.
+
+    The merged artifact carries the same reuse fingerprint as a single-process
+    run, so downstream stages cannot tell a sharded run from a sequential one.
+    """
+
+    parse_walk_forward_protocol(config)
+    _, _, _, rep_manifest, _ = _load_representation_bundle(config)
+    targets, target_manifest = _aligned_validation_targets(config)
+    probe_root = _run_directory(config) / "walk_forward_probe"
+    output = probe_root / "validation"
+    expected = {
+        "schema_version": WALK_FORWARD_PROBE_SCHEMA,
+        "representation_fingerprint": rep_manifest["representation_fingerprint"],
+        "config_sha256": protocol_config_hash(config),
+        "target_alignment_fingerprint": target_manifest["alignment_fingerprint"],
+    }
+    if _reuse_exact_output(
+        output, expected_manifest=expected, validator=validate_walk_forward_probe_outputs
+    ):
+        return output
+    file_names = (
+        "walk_forward_probe_metrics.csv",
+        "walk_forward_oos_predictions.parquet",
+        "walk_forward_tuning.csv",
+        "walk_forward_selected_alphas.csv",
+        "walk_forward_eligibility.csv",
+    )
+    parts: dict[str, list[pd.DataFrame]] = {}
+    shard_manifests: list[dict[str, object]] = []
+    for tag in shard_tags:
+        shard_dir = probe_root / f"validation_shard_{tag}"
+        for name in file_names:
+            path = shard_dir / name
+            if not path.is_file():
+                raise FileNotFoundError(f"shard {tag} 缺少产物: {path}")
+            parts.setdefault(name, []).append(
+                pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+            )
+        shard_manifests.append(
+            json.loads((shard_dir / "manifest.json").read_text(encoding="utf-8"))
+        )
+    tables = {name: pd.concat(frames, ignore_index=True) for name, frames in parts.items()}
+    selections = tables["walk_forward_selected_alphas.csv"]
+    expected_tasks = set(targets["task_id"].astype(str).unique())
+    actual_tasks = set(selections["task_id"].astype(str).unique())
+    layer_sets = selections.groupby("task_id")["layer"].agg(set)
+    if actual_tasks != expected_tasks or not layer_sets.map(
+        lambda values: values == set(range(13))
+    ).all():
+        missing = sorted(expected_tasks.difference(actual_tasks))
+        raise ValueError(
+            "合并后的walk-forward probe未覆盖全部任务或13层: "
+            f"missing_tasks={missing}"
+        )
+    base_manifest = dict(shard_manifests[0])
+    for key in ("partial", "shard_tag", "shard_task_ids", "created_at"):
+        base_manifest.pop(key, None)
+    return _atomic_write_once(
+        output,
+        tables=tables,
+        manifest={
+            **base_manifest,
+            **expected,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "partial": False,
+            "merged_from_shards": list(shard_tags),
+            "final_test_rows_loaded": False,
         },
     )
 

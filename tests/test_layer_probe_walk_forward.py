@@ -338,3 +338,49 @@ def test_walk_forward_probe_shard_merge_matches_sequential(tmp_path: Path):
         check_exact=False,
         rtol=1e-5,
     )
+
+
+def test_walk_forward_probe_layer_shard_merge_matches_sequential(tmp_path: Path):
+    import shutil
+
+    task_ids = ("residual_signed_raw__fh0", "residual_signed_raw__fh1")
+    config = _walk_forward_artifacts(tmp_path, task_ids=task_ids)
+    align_walk_forward_targets(config)
+
+    sequential = run_walk_forward_probe_stage(config)
+    seq_pred = pd.read_parquet(
+        sequential / "walk_forward_oos_predictions.parquet"
+    )
+    seq_sel = pd.read_csv(sequential / "walk_forward_selected_alphas.csv")
+
+    shutil.rmtree(sequential)
+    even = [layer for layer in range(13) if layer % 2 == 0]
+    odd = [layer for layer in range(13) if layer % 2 == 1]
+    run_walk_forward_probe_stage(config, layers=even, shard_tag="even")
+    run_walk_forward_probe_stage(config, layers=odd, shard_tag="odd")
+    merged = merge_walk_forward_probe_shards(config, ["even", "odd"])
+    assert validate_walk_forward_probe_outputs(merged)["tasks"] == 2
+
+    merged_pred = pd.read_parquet(
+        merged / "walk_forward_oos_predictions.parquet"
+    )
+    merged_sel = pd.read_csv(merged / "walk_forward_selected_alphas.csv")
+
+    sort_cols = ["task_id", "layer", "sample_id"]
+    pd.testing.assert_frame_equal(
+        merged_pred.sort_values(sort_cols).reset_index(drop=True)[
+            ["task_id", "layer", "sample_id", "prediction"]
+        ].astype({"prediction": "float64"}),
+        seq_pred.sort_values(sort_cols).reset_index(drop=True)[
+            ["task_id", "layer", "sample_id", "prediction"]
+        ].astype({"prediction": "float64"}),
+        check_exact=False,
+        rtol=1e-5,
+    )
+    sel_cols = ["task_id", "layer", "selected_alpha", "mean_fold_spearman"]
+    pd.testing.assert_frame_equal(
+        merged_sel.sort_values(sel_cols).reset_index(drop=True)[sel_cols],
+        seq_sel.sort_values(sel_cols).reset_index(drop=True)[sel_cols],
+        check_exact=False,
+        rtol=1e-5,
+    )

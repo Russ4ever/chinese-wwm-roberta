@@ -569,15 +569,18 @@ def run_walk_forward_probe_stage(
     config: Mapping[str, object],
     *,
     task_ids: Sequence[str] | None = None,
+    layers: Sequence[int] | None = None,
     shard_tag: str | None = None,
 ) -> Path:
     """Fit annual expanding StandardScaler+Ridge probes on validation folds.
 
-    When ``task_ids``/``shard_tag`` are set the stage processes only those tasks
-    and writes a partial shard directory (``validation_shard_<shard_tag>``)
-    without the full coverage check; ``merge_walk_forward_probe_shards``
-    reassembles shards into the canonical ``validation`` directory so the
-    fingerprint matches a single-process run.
+    When ``task_ids``/``layers``/``shard_tag`` are set the stage processes only
+    the requested (task, layer) pairs and writes a partial shard directory
+    (``validation_shard_<shard_tag>``) without the full coverage check;
+    ``merge_walk_forward_probe_shards`` reassembles shards into the canonical
+    ``validation`` directory so the fingerprint matches a single-process run.
+    Sharding by (task, layer) instead of by task lets the 13 layers of every
+    task run in parallel across workers instead of serially within one shard.
     """
 
     protocol = parse_walk_forward_protocol(config)
@@ -642,8 +645,11 @@ def run_walk_forward_probe_stage(
                 {"task_id": task_id, "eligible": False, "reason": "no_positive_weight_rows"}
             )
             continue
-        for layer in range(13):
-            print(f"[stage6]   {task_id} layer {layer}", flush=True)
+        for layer in (layers if layers is not None else range(13)):
+            print(
+                f"[stage6{f'/{shard_tag}' if sharded else ''}]   {task_id} layer {layer}",
+                flush=True,
+            )
             fold_payloads: list[dict[str, object]] = []
             for fold in protocol.folds:
                 train_mask, evaluation_mask = fold_masks(task, fold, protocol)
@@ -873,6 +879,10 @@ def run_walk_forward_probe_stage(
             "shard_task_ids": (
                 [str(task_id) for task_id, _ in grouped] if sharded else None
             ),
+            "shard_layers": (
+                [int(layer) for layer in (layers if layers is not None else range(13))]
+                if sharded else None
+            ),
             "oos_contract": (
                 "for fold Y train feature<Y and label_available<Y; "
                 "evaluation outcomes known by selection cutoff"
@@ -940,7 +950,7 @@ def merge_walk_forward_probe_shards(
             f"missing_tasks={missing}"
         )
     base_manifest = dict(shard_manifests[0])
-    for key in ("partial", "shard_tag", "shard_task_ids", "created_at"):
+    for key in ("partial", "shard_tag", "shard_task_ids", "shard_layers", "created_at"):
         base_manifest.pop(key, None)
     return _atomic_write_once(
         output,

@@ -1,6 +1,6 @@
 # Current Layer Probe experiment status
 
-Last updated: 2026-08-25 (Asia/Shanghai)
+Last updated: 2026-09-01 (Asia/Shanghai)
 
 This file is the handoff source for the active full-history continuous-label
 Layer Probe run. Read it before modifying configs, rerunning a stage, or
@@ -159,20 +159,41 @@ state that has only been reported through the running notebook.
   `compute_dtype_epsilon * abs(pilot_mean)` instead of an unstable near-zero
   denominator. Both the 5-million checkpoint and final stage write a 98-row
   per-population/per-site audit table with exact failures and maxima.
-- The notebook still has exactly eight idempotent orchestration cells. Old
-  remote outputs were cleared. If a genuine v2 norm audit fails, Cell 5 displays
-  the saved per-site table before re-raising, and completed fingerprint-matching
-  shards remain resumable.
-- Local validation after the v2 fix is **96 passing tests**, including 17
-  activation-rank tests. New regression coverage verifies selected-dtype norm
-  calibration, scale-aware near-constant norms, ordinary-token blocking,
-  non-blocking CLS warnings, unfiltered CLS routing, and the isolated v2 run
-  path. Black formatting, Python compilation, notebook AST/structure, and diff
-  whitespace checks pass.
-- No real v2 pilot or main scan has been run or synchronized locally. Do not
-  interpret v1 shard moments, and do not claim the activation-rank experiment is
-  complete until the v2 remote manifests and result tables have been copied
-  back and hash-validated.
+- The notebook now has ten cells. Cells 1-8 remain the idempotent core v2
+  pipeline; Cell 9 is a descriptive spectral summary of the canonical analysis
+  artifacts. The notebook currently has a mixed execution state: Cell 5 has no
+  stored result, while several later cells retain outputs. The canonical remote
+  artifacts have not been synchronized and hash-validated locally, so these
+  stored outputs are not confirmation of a valid completed v2 run.
+- On 2026-09-01 the former Cell 10 was superseded. Its attention and MLP paths
+  jointly modified all 12 layers while its residual path modified only Layer 6,
+  it evaluated PCA-sample reports, used one mask seed, rounded CE before the
+  recovery calculation, clipped small denominators to `1e-8`, skipped an actual
+  full-space projection at `N=768`, and hard-coded `cuda:0`. Those results are
+  methodologically incomparable and must not be interpreted.
+- The replacement Cell 10 is a label-free extension implemented in
+  `src/activation_rank_loss_recovery.py` with policy
+  `configs/activation_rank_loss_recovery.yaml`. It applies one intervention at a
+  time to `attention_output_06`, `mlp_output_06`, or `residual_06`; selects 256
+  evaluation reports disjoint from the PCA/rank sample by both `report_id` and
+  text hash; reuses identical masks across conditions for three fixed mask
+  seeds; retains raw unrounded CE; report-block bootstraps confidence intervals;
+  and reports `non_identifiable` rather than a recovery fraction when the zero-
+  ablation denominator fails the predeclared magnitude or signal-to-noise gate.
+  `N=768` is executed as a real projection and must pass an absolute-loss
+  identity audit. Outputs include the held-out manifest, mask audit, per-report
+  losses, metrics, site summary, figure, preflight, and a hash-linked manifest.
+- Cell 10 uses the configured device (physical GPU 1 by default) and calls the
+  standard preflight. Its loss is explicitly named an MLM proxy because it
+  combines the fine-tuned backbone with the base model's MLM head; it is not the
+  checkpoint's original supervised loss and does not establish downstream
+  return predictiveness. No real execution of the replacement Cell 10 has been
+  confirmed.
+- Local code validation after the Cell 10 correction is **102 passing tests**.
+  This includes deterministic held-out selection, ID/text-hash disjointness,
+  multi-seed/same-mask validation, non-identifiable denominator handling,
+  full-projection equivalence, exception-safe hook removal, and the ten-cell
+  notebook structure. This is code validation only, not empirical completion.
 
 ## Confirmed label state
 

@@ -585,11 +585,23 @@ def test_auxiliary_segment_ledger_makes_retry_idempotent(tmp_path: Path):
     assert manifest["included_segments"] == retry_manifest["included_segments"]
 
 
-def test_notebook_has_exactly_eight_orchestration_cells_and_is_ast_valid():
+def test_notebook_has_ten_orchestration_cells_and_is_ast_valid():
     notebook_path = ROOT / "notebooks" / "activation_rank_pipeline.ipynb"
     notebook = nbformat.read(notebook_path, as_version=4)
-    assert len(notebook.cells) == 8
-    assert [cell.cell_type for cell in notebook.cells] == ["code"] * 8
+    assert len(notebook.cells) == 10
+    assert [cell.cell_type for cell in notebook.cells] == ["code"] * 10
+    assert [cell.id for cell in notebook.cells] == [
+        "imports-config",
+        "preflight",
+        "sample-manifest",
+        "pilot",
+        "rank-shards",
+        "rank-analysis",
+        "wo-mechanism",
+        "figures-final",
+        "spectral-analysis",
+        "loss-recovery",
+    ]
     trees = [ast.parse(cell.source) for cell in notebook.cells]
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
@@ -598,6 +610,8 @@ def test_notebook_has_exactly_eight_orchestration_cells_and_is_ast_valid():
     )
     assert "run_rank_shards_stage(config)" in notebook.cells[4].source
     assert "run_wo_mechanism_stage(config)" in notebook.cells[6].source
-    assert all(
-        cell.execution_count is None and not cell.outputs for cell in notebook.cells
-    )
+    cell10 = notebook.cells[9]
+    assert "run_loss_recovery_stage(config, LOSS_RECOVERY_POLICY)" in cell10.source
+    assert "cuda:0" not in cell10.source
+    assert "experiment_sites" not in cell10.source
+    assert cell10.execution_count is None and not cell10.outputs

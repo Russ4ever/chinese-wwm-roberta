@@ -1,0 +1,36 @@
+schema_version: activation_rank_loss_recovery_policy_v1.0
+
+# This extension is label-free. It measures an MLM-proxy loss after a
+# single-position projection at Layer 6; it is not a supervised probe.
+experiment:
+  name: checkpoint_activation_rank_loss_recovery
+  run_id: single_position_layer06_v1
+
+evaluation:
+  layer: 6
+  report_count: 256
+  order_seed: checkpoint_activation_rank_loss_recovery_v1
+  mask_seeds: [20260901, 20260902, 20260903]
+  mask_probability: 0.15
+  batch_size: 32
+
+projection:
+  components: [0, 16, 32, 64, 128, 192, 256, 384, 512, 640, 704, 736, 768]
+
+inference:
+  # Use the dtype already selected by the activation-rank pilot.
+  use_pilot_dtype: true
+
+identifiability:
+  # A recovery fraction is reported only if zero ablation causes a stable,
+  # positive loss increase. Both conditions below must pass.
+  minimum_ablation_delta: 0.002
+  minimum_signal_to_noise: 3.0
+  bootstrap_samples: 2000
+  bootstrap_seed: 20260901
+  confidence_level: 0.95
+  full_projection_absolute_tolerance: 0.001
+  sustained_recovery_threshold: 0.99
+
+output:
+  subdirectory: extensions/loss_recovery_single_layer06_v1

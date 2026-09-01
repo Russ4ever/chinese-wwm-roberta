@@ -213,7 +213,9 @@ def path_a_loss_recovery(device: str = "cuda:0", n_texts: int = N_TEXTS_DEFAULT)
     base_dir = str(ROOT / CONFIG["model"]["base_model_dir"])
     mlm = BertForMaskedLM.from_pretrained(base_dir)
     state = strip_prefix(load_state_dict_safe(str(ROOT / CONFIG["model"]["checkpoint"]), map_location="cpu"))
-    bert_state = {k[len("bert."):]: v for k, v in state.items() if k.startswith("bert.")}
+    # BertForMaskedLM 的 bert 默认不含 pooler, 过滤掉 checkpoint 中的 pooler 权重
+    bert_state = {k[len("bert."):]: v for k, v in state.items()
+                  if k.startswith("bert.") and not k.startswith("bert.pooler.")}
     mlm.bert.load_state_dict(bert_state, strict=True)
     mlm = mlm.to(device=device, dtype=torch.float16).eval()
     bert = mlm.bert

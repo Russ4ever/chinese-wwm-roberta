@@ -604,7 +604,11 @@ def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
     metric_records: list[dict[str, object]] = []
     prediction_frames: list[pd.DataFrame] = []
     eligibility: list[dict[str, object]] = []
-    for task_id, raw_task in targets.groupby("task_id", sort=True):
+    n_tasks = targets["task_id"].nunique()
+    for task_index, (task_id, raw_task) in enumerate(
+        targets.groupby("task_id", sort=True), start=1
+    ):
+        print(f"[stage6] task {task_index}/{n_tasks} {task_id}", flush=True)
         task = _positive_rows(raw_task)
         if task.empty:
             eligibility.append(
@@ -612,6 +616,7 @@ def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
             )
             continue
         for layer in range(13):
+            print(f"[stage6]   {task_id} layer {layer}", flush=True)
             fold_payloads: list[dict[str, object]] = []
             for fold in protocol.folds:
                 train_mask, evaluation_mask = fold_masks(task, fold, protocol)
@@ -807,6 +812,7 @@ def run_walk_forward_probe_stage(config: Mapping[str, object]) -> Path:
             "walk-forward probe未覆盖全部任务或13层: "
             f"missing_tasks={missing}"
         )
+    print("[stage6] writing walk_forward_probe/validation outputs", flush=True)
     return _atomic_write_once(
         output,
         tables={

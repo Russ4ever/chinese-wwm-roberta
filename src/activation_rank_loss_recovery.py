@@ -36,8 +36,6 @@ from .activation_rank import (
     _run_directory,
     preflight_activation_rank,
     run_pilot_stage,
-    run_rank_analysis_stage,
-    run_sample_stage,
     validate_pilot_outputs,
 )
 from .config import load_yaml_config
@@ -681,14 +679,23 @@ def run_loss_recovery_stage(
 
     policy_path = Path(policy_path).expanduser().resolve()
     policy = load_loss_recovery_policy(policy_path)
-    analysis = run_rank_analysis_stage(config)
-    sample_directory = run_sample_stage(config)
+    run_dir = _run_directory(config)
+    analysis = run_dir / "analysis"
+    sample_directory = run_dir / "sample"
     analysis_manifest_path = analysis / "manifest.json"
+    if not analysis_manifest_path.is_file():
+        raise RuntimeError(
+            "上游 analysis 产物不存在, 请先执行 notebook cells 1-6 生成 rank analysis"
+        )
+    if not (sample_directory / "sample_manifest.parquet").is_file():
+        raise RuntimeError(
+            "上游 sample 产物不存在, 请先执行 notebook cells 1-3 生成 sample manifest"
+        )
     analysis_manifest = json.loads(analysis_manifest_path.read_text(encoding="utf-8"))
     expected = {
         "schema_version": LOSS_RECOVERY_SCHEMA,
-        "upstream_run_fingerprint": analysis_manifest["run_fingerprint"],
-        "upstream_execution_fingerprint": analysis_manifest["execution_fingerprint"],
+        "upstream_run_fingerprint": analysis_manifest.get("run_fingerprint", ""),
+        "upstream_execution_fingerprint": analysis_manifest.get("execution_fingerprint", ""),
         "upstream_analysis_manifest_sha256": sha256_file(analysis_manifest_path),
         "policy_sha256": sha256_file(policy_path),
         "loss_recovery_code_sha256": sha256_file(Path(__file__)),
@@ -697,7 +704,7 @@ def run_loss_recovery_stage(
     relative = Path(str(output_cfg.get("subdirectory", "")))
     if not str(relative) or relative.is_absolute() or ".." in relative.parts:
         raise ValueError("output.subdirectory必须是安全的相对路径")
-    output = _run_directory(config) / relative
+    output = run_dir / relative
     if output.exists():
         validate_loss_recovery_outputs(output, expected)
         return output

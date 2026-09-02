@@ -46,8 +46,8 @@ def _synthetic_distances(policy):
             delta = 0.0001 if kind == "mlp_output" else 1.0
             for index, report_id in enumerate(report_ids):
                 base = 0.5 + index * 0.1
-                for n_components, recovered in ((0, 0.0), (384, 0.9), (768, 1.0)):
-                    dist = delta * (1.0 - recovered) + base * 0.001
+                for n_components, recovered in ((0, 0.0), (384, 1.0), (768, 1.0)):
+                    dist = delta * (1.0 - recovered) + base * 0.0001
                     rows.append(
                         {
                             "condition": "projection",

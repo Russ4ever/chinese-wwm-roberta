@@ -136,19 +136,19 @@ def test_identical_projectors_coverage():
 # Cumulative coverage: orthogonal layers grow linearly
 # --------------------------------------------------------------------------- #
 def test_orthogonal_layers_cumulative_growth():
-    # 3 disjoint 64-dim subspaces in 768-dim space
-    V1 = np.eye(HIDDEN_DIM, 64)
-    V2 = np.eye(HIDDEN_DIM, 64, 64)
-    V3 = np.eye(HIDDEN_DIM, 64, 128)
+    # 3 disjoint 64-dim subspaces in 768-dim space (explicit construction)
+    V1 = np.zeros((HIDDEN_DIM, 64))
+    V1[:64, :] = np.eye(64)
+    V2 = np.zeros((HIDDEN_DIM, 64))
+    V2[64:128, :] = np.eye(64)
+    V3 = np.zeros((HIDDEN_DIM, 64))
+    V3[128:192, :] = np.eye(64)
     projectors = [compute_projector(V) for V in (V1, V2, V3)]
     eigvals_m1 = np.linalg.eigvalsh(projectors[0])[::-1]
     eigvals_m3 = np.linalg.eigvalsh(np.mean(projectors, axis=0))[::-1]
     summary_m1 = coverage_summary_row(eigvals_m1)
     summary_m3 = coverage_summary_row(eigvals_m3)
     # 3 disjoint subspaces: 192 dirs with eigenvalue 1/3, 576 with 0
-    # effective rank should grow (64 -> ~192), more low-coverage dirs
     assert summary_m3["effective_coverage_rank"] > summary_m1["effective_coverage_rank"]
-    # 1/3 ≈ 0.33 < 0.50, so no directions reach 0.50
-    assert summary_m3["directions_coverage_above_050"] == 0
-    # 576 zero-eigenvalue directions are below 0.05
+    assert summary_m3["directions_coverage_above_050"] == 0   # 1/3 < 0.50
     assert summary_m3["directions_coverage_below_005"] == HIDDEN_DIM - 192

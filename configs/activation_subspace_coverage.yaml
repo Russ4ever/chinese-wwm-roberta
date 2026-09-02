@@ -1,0 +1,27 @@
+schema_version: activation_subspace_coverage_policy_v1.0
+
+# Label-free attention output write-space coverage analysis.
+# Pure linear algebra on existing SVD results — no model, no GPU, no labels.
+experiment:
+  name: attention_subspace_coverage
+  run_id: coverage_v1
+
+input:
+  stream: token_natural_filtered
+  site_kind: attention_output
+
+parameters:
+  k_grid: [64, 128, 256, 384, 512, 640]
+  primary_k: 256
+  n_layers: 12
+  low_coverage_n: 128
+  high_coverage_n: 128
+  tolerances:
+    orthogonal: 1.0e-5
+    symmetry: 1.0e-5
+    projector: 1.0e-4
+    trace: 1.0e-6
+    psd: 1.0e-8
+
+output:
+  subdirectory: extensions/attention_subspace_coverage_v1

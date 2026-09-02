@@ -35,8 +35,6 @@ from .activation_rank import (
     _read_report_texts,
     _run_directory,
     preflight_activation_rank,
-    run_pilot_stage,
-    validate_pilot_outputs,
 )
 from .config import load_yaml_config
 from .layer_probe_representations import (
@@ -710,7 +708,13 @@ def run_loss_recovery_stage(
         return output
 
     preflight = preflight_activation_rank(config)
-    pilot = validate_pilot_outputs(run_pilot_stage(config))
+    pilot_dir = run_dir / "pilot"
+    pilot_manifest_path = pilot_dir / "manifest.json"
+    if not pilot_manifest_path.is_file():
+        raise RuntimeError(
+            "pilot 产物不存在, 请先执行 notebook cells 1-4 生成 pilot"
+        )
+    pilot = json.loads(pilot_manifest_path.read_text(encoding="utf-8"))
     evaluation = _mapping(policy, "evaluation")
     projection = _mapping(policy, "projection")
     layers = [int(v) for v in evaluation["layers"]]

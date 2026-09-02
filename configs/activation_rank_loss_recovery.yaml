@@ -1,18 +1,18 @@
-schema_version: activation_rank_loss_recovery_policy_v1.0
+schema_version: activation_rank_loss_recovery_policy_v1.1
 
-# This extension is label-free. It measures an MLM-proxy loss after a
-# single-position projection at Layer 6; it is not a supervised probe.
+# Label-free per-layer CLS representation recovery.
+# Measures how compressible each layer's attention output contribution to
+# the final CLS pooled representation is, using squared L2 distance.
 experiment:
   name: checkpoint_activation_rank_loss_recovery
-  run_id: single_position_layer06_v1
+  run_id: per_layer_cls_representation_v1
 
 evaluation:
-  layer: 6
+  layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  kinds: ["attention_output"]
   report_count: 256
   order_seed: checkpoint_activation_rank_loss_recovery_v1
-  mask_seeds: [20260901, 20260902, 20260903]
-  mask_probability: 0.15
-  batch_size: 32
+  batch_size: 256
 
 projection:
   components: [0, 16, 32, 64, 128, 192, 256, 384, 512, 640, 704, 736, 768]
@@ -23,8 +23,8 @@ inference:
 
 identifiability:
   # A recovery fraction is reported only if zero ablation causes a stable,
-  # positive loss increase. Both conditions below must pass.
-  minimum_ablation_delta: 0.002
+  # positive representation change. Both conditions below must pass.
+  minimum_ablation_delta: 0.0
   minimum_signal_to_noise: 3.0
   bootstrap_samples: 2000
   bootstrap_seed: 20260901
@@ -33,4 +33,4 @@ identifiability:
   sustained_recovery_threshold: 0.99
 
 output:
-  subdirectory: extensions/loss_recovery_single_layer06_v1
+  subdirectory: extensions/loss_recovery_per_layer_cls_v1

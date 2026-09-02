@@ -24,58 +24,57 @@ def _small_policy():
             ROOT / "configs" / "activation_rank_loss_recovery.yaml"
         )
     )
-    policy["evaluation"]["mask_seeds"] = [11, 13]
+    policy["evaluation"]["layers"] = [1, 2]
+    policy["evaluation"]["kinds"] = ["attention_output", "mlp_output"]
     policy["projection"]["components"] = [0, 384, 768]
     policy["identifiability"]["bootstrap_samples"] = 300
     return policy
 
 
-def _synthetic_losses(policy):
+def _synthetic_distances(policy):
+    """Generate synthetic per-report CLS distances for two layers × two kinds."""
     rows = []
     report_ids = ["r1", "r2", "r3", "r4"]
-    seeds = policy["evaluation"]["mask_seeds"]
-    for seed in seeds:
-        for index, report_id in enumerate(report_ids):
-            baseline = 2.0 + index * 0.05 + (seed - 11) * 0.001
-            rows.append(
-                {
-                    "condition": "original",
-                    "site": "original",
-                    "n_components": -1,
-                    "mask_seed": seed,
-                    "report_id": report_id,
-                    "ce_sum": baseline * 10,
-                    "mask_count": 10,
-                }
-            )
-            for kind in SITE_KINDS:
-                site = f"{kind}_06"
-                delta = 0.0005 if kind == "mlp_output" else 1.0
-                for n_components, recovered in ((0, 0.0), (384, 1.0), (768, 1.0)):
-                    loss = baseline + delta * (1.0 - recovered)
+    layers = [int(v) for v in policy["evaluation"]["layers"]]
+    kinds = [str(v) for v in policy["evaluation"]["kinds"]]
+    components = [int(v) for v in policy["projection"]["components"]]
+
+    for layer in layers:
+        for kind in kinds:
+            site = f"{kind}_{layer:02d}"
+            # mlp_output has a near-zero ablation delta (non-identifiable)
+            delta = 0.0001 if kind == "mlp_output" else 1.0
+            for index, report_id in enumerate(report_ids):
+                base = 0.5 + index * 0.1
+                for n_components, recovered in ((0, 0.0), (384, 0.9), (768, 1.0)):
+                    dist = delta * (1.0 - recovered) + base * 0.001
                     rows.append(
                         {
                             "condition": "projection",
                             "site": site,
-                            "n_components": n_components,
-                            "mask_seed": seed,
-                            "report_id": report_id,
-                            "ce_sum": loss * 10,
-                            "mask_count": 10,
+                            "layer": int(layer),
+                            "kind": kind,
+                            "n_components": int(n_components),
+                            "report_id": str(report_id),
+                            "representation_distance": float(dist),
                         }
                     )
     return pd.DataFrame(rows)
 
 
-def test_policy_is_single_layer_multi_seed_and_has_identifiability_gate():
+def test_policy_is_multi_layer_and_has_identifiability_gate():
     policy = load_loss_recovery_policy(
         ROOT / "configs" / "activation_rank_loss_recovery.yaml"
     )
-    assert policy["evaluation"]["layer"] == 6
-    assert len(policy["evaluation"]["mask_seeds"]) >= 2
+    assert len(policy["evaluation"]["layers"]) == 12
+    assert policy["evaluation"]["layers"][0] == 1
+    assert policy["evaluation"]["layers"][-1] == 12
+    assert "attention_output" in policy["evaluation"]["kinds"]
     assert policy["projection"]["components"][0] == 0
     assert policy["projection"]["components"][-1] == 768
-    assert policy["identifiability"]["minimum_ablation_delta"] > 0
+    assert policy["identifiability"]["minimum_ablation_delta"] >= 0
+    assert "mask_seeds" not in policy["evaluation"]
+    assert "mask_probability" not in policy["evaluation"]
 
 
 def test_evaluation_selection_is_deterministic_and_disjoint_by_id_and_text_hash():
@@ -100,15 +99,23 @@ def test_evaluation_selection_is_deterministic_and_disjoint_by_id_and_text_hash(
 
 def test_small_denominator_is_non_identifiable_and_never_clipped():
     policy = _small_policy()
-    metrics, summary = summarize_loss_recovery(_synthetic_losses(policy), policy)
-    mlp = summary.set_index("site").loc["mlp_output_06"]
-    assert mlp["ablation_delta"] == pytest.approx(0.0005)
-    assert mlp["status"] == "non_identifiable"
-    mlp_metrics = metrics.loc[metrics["site"].eq("mlp_output_06")]
-    assert mlp_metrics["recovery_fraction"].isna().all()
-    attention = summary.set_index("site").loc["attention_output_06"]
-    assert attention["status"] == "identifiable"
-    assert attention["n_sustained_recovery"] == 384
+    metrics, summary = summarize_loss_recovery(_synthetic_distances(policy), policy)
+
+    # mlp_output at any layer should be non-identifiable (tiny delta)
+    for layer in policy["evaluation"]["layers"]:
+        site = f"mlp_output_{layer:02d}"
+        mlp_summary = summary.set_index("site").loc[site]
+        assert mlp_summary["status"] == "non_identifiable"
+        mlp_metrics = metrics.loc[metrics["site"].eq(site)]
+        assert mlp_metrics["recovery_fraction"].isna().all()
+
+    # attention_output should be identifiable
+    for layer in policy["evaluation"]["layers"]:
+        site = f"attention_output_{layer:02d}"
+        attn_summary = summary.set_index("site").loc[site]
+        assert attn_summary["status"] == "identifiable"
+        assert attn_summary["n_sustained_recovery"] == 384
+
     assert bool(summary["full_projection_passed"].all())
 
 

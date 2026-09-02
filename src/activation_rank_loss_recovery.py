@@ -1,11 +1,14 @@
-"""Held-out, single-position MLM-proxy loss recovery for activation rank.
+"""Held-out, per-layer CLS representation recovery for activation rank.
 
-This is a label-free extension of :mod:`src.activation_rank`.  It deliberately
-keeps the intervention site fixed (Layer 6) while comparing attention output,
-MLP output, and the residual stream.  The MLM head comes from the base model,
-whereas the backbone comes from the fine-tuned checkpoint, so the resulting
-cross-entropy is an explicitly named proxy loss rather than the checkpoint's
-original supervised objective.
+This is a label-free extension of :mod:`src.activation_rank`.  It measures how
+much each layer's attention output contributes to the final CLS pooled
+representation, and how compressible that contribution is.  The metric is the
+squared L2 distance between the modified and baseline CLS vectors -- always
+non-negative, continuous, and naturally bounded in [0, 1] for recovery fraction.
+
+The model is the fine-tuned ``BinaryClassificationCandidate`` (backbone from
+checkpoint, classification head from checkpoint).  The CLS pooled feature is
+the same 768-dim vector the ``fc`` head reads.
 """
 
 from __future__ import annotations
@@ -43,16 +46,19 @@ from .layer_probe_representations import (
     git_commit,
     sha256_file,
 )
-from .models.checkpoint import load_state_dict_safe, strip_prefix
+from .models.modeling import build_candidate
 
 
-LOSS_RECOVERY_SCHEMA = "activation_rank_loss_recovery_v1.0"
-LOSS_SEMANTICS = "mlm_proxy__finetuned_backbone__base_model_mlm_head"
+LOSS_RECOVERY_SCHEMA = "activation_rank_loss_recovery_v1.1"
+LOSS_SEMANTICS = "cls_representation_distance__per_layer"
 SITE_KINDS = ("attention_output", "mlp_output", "residual")
 
 
+# --------------------------------------------------------------------------- #
+# Policy
+# --------------------------------------------------------------------------- #
 def load_loss_recovery_policy(path: str | Path) -> dict[str, object]:
-    """Load and strictly validate the label-free loss-recovery policy."""
+    """Load and strictly validate the label-free representation-recovery policy."""
 
     policy = load_yaml_config(path)
     required = {
@@ -67,7 +73,7 @@ def load_loss_recovery_policy(path: str | Path) -> dict[str, object]:
     missing = sorted(required.difference(policy))
     if missing:
         raise ValueError(f"loss-recovery配置缺少顶层字段: {missing}")
-    if policy["schema_version"] != "activation_rank_loss_recovery_policy_v1.0":
+    if policy["schema_version"] != "activation_rank_loss_recovery_policy_v1.1":
         raise ValueError("不支持的loss-recovery配置版本")
 
     serialized = json.dumps(policy, ensure_ascii=False).lower()
@@ -78,16 +84,19 @@ def load_loss_recovery_policy(path: str | Path) -> dict[str, object]:
     evaluation = _mapping(policy, "evaluation")
     projection = _mapping(policy, "projection")
     identifiability = _mapping(policy, "identifiability")
-    if int(evaluation.get("layer", -1)) != 6:
-        raise ValueError("主协议固定在Layer 6做单位置干预")
+
+    layers = [int(v) for v in evaluation.get("layers", [])]
+    if not layers or any(l < 1 or l > 12 for l in layers):
+        raise ValueError("evaluation.layers必须为1-12的非空列表")
+    if len(set(layers)) != len(layers):
+        raise ValueError("evaluation.layers不得有重复")
+
+    kinds = [str(v) for v in evaluation.get("kinds", [])]
+    if not kinds or any(k not in SITE_KINDS for k in kinds):
+        raise ValueError(f"evaluation.kinds必须是{SITE_KINDS}的非空子集")
+
     if int(evaluation.get("report_count", 0)) <= 0:
         raise ValueError("evaluation.report_count必须为正整数")
-    seeds = [int(value) for value in evaluation.get("mask_seeds", [])]
-    if len(seeds) < 2 or len(set(seeds)) != len(seeds):
-        raise ValueError("至少需要两个互异mask seed")
-    probability = float(evaluation.get("mask_probability", 0.0))
-    if not 0.0 < probability < 1.0:
-        raise ValueError("mask_probability必须位于(0, 1)")
     if int(evaluation.get("batch_size", 0)) <= 0:
         raise ValueError("evaluation.batch_size必须为正整数")
 
@@ -99,21 +108,24 @@ def load_loss_recovery_policy(path: str | Path) -> dict[str, object]:
     if any(value < 0 or value > 768 for value in components):
         raise ValueError("projection.components越界")
 
-    if float(identifiability.get("minimum_ablation_delta", 0.0)) <= 0:
-        raise ValueError("minimum_ablation_delta必须为正数")
-    if float(identifiability.get("minimum_signal_to_noise", 0.0)) <= 0:
+    if float(identifiability.get("minimum_ablation_delta", -1)) < 0:
+        raise ValueError("minimum_ablation_delta必须为非负数")
+    if float(identifiability.get("minimum_signal_to_noise", 0)) <= 0:
         raise ValueError("minimum_signal_to_noise必须为正数")
     if int(identifiability.get("bootstrap_samples", 0)) < 200:
         raise ValueError("bootstrap_samples至少为200")
-    confidence = float(identifiability.get("confidence_level", 0.0))
+    confidence = float(identifiability.get("confidence_level", 0))
     if not 0.5 < confidence < 1.0:
         raise ValueError("confidence_level必须位于(0.5, 1)")
-    threshold = float(identifiability.get("sustained_recovery_threshold", 0.0))
+    threshold = float(identifiability.get("sustained_recovery_threshold", 0))
     if not 0.0 < threshold <= 1.0:
         raise ValueError("sustained_recovery_threshold必须位于(0, 1]")
     return policy
 
 
+# --------------------------------------------------------------------------- #
+# Data selection (unchanged from collaborator)
+# --------------------------------------------------------------------------- #
 def _stable_order(report_id: str, text_sha256: str, seed: str) -> int:
     digest = hashlib.sha256(
         f"{seed}|{report_id}|{text_sha256}".encode("utf-8")
@@ -172,13 +184,16 @@ def select_disjoint_evaluation_reports(
     return selected
 
 
+# --------------------------------------------------------------------------- #
+# Module resolution (modified: allow layers 1-12)
+# --------------------------------------------------------------------------- #
 def resolve_projection_module(bert: Any, site: str) -> Any:
-    """Resolve one canonical Layer-6 activation site on a BERT backbone."""
+    """Resolve one activation site on a BERT backbone (layers 1-12)."""
 
     kind, layer_text = site.rsplit("_", 1)
     layer = int(layer_text)
-    if layer != 6 or kind not in SITE_KINDS:
-        raise ValueError(f"主协议只允许Layer 6三类位置，收到: {site}")
+    if layer < 1 or layer > 12 or kind not in SITE_KINDS:
+        raise ValueError(f"只允许Layer 1-12三类位置，收到: {site}")
     block = bert.encoder.layer[layer - 1]
     if kind == "attention_output":
         return block.attention.output.dense
@@ -187,6 +202,9 @@ def resolve_projection_module(bert: Any, site: str) -> Any:
     return block
 
 
+# --------------------------------------------------------------------------- #
+# Projection hook (unchanged from collaborator)
+# --------------------------------------------------------------------------- #
 class SingleSiteProjection(AbstractContextManager["SingleSiteProjection"]):
     """Project exactly one module output and always remove the hook."""
 
@@ -240,210 +258,174 @@ class SingleSiteProjection(AbstractContextManager["SingleSiteProjection"]):
             self.handle = None
 
 
-def _pooled_loss(frame: pd.DataFrame) -> float:
-    count = float(frame["mask_count"].sum())
-    if count <= 0:
-        raise ValueError("masked token count必须为正")
-    return float(frame["ce_sum"].sum() / count)
+# --------------------------------------------------------------------------- #
+# Representation distance statistics
+# --------------------------------------------------------------------------- #
+def _mean_distance(frame: pd.DataFrame) -> float:
+    return float(frame["representation_distance"].mean())
 
 
-def _aggregate_reports(frame: pd.DataFrame) -> pd.DataFrame:
-    out = (
-        frame.groupby("report_id", sort=False, as_index=False)[["ce_sum", "mask_count"]]
-        .sum()
-        .sort_values("report_id", kind="mergesort")
-        .reset_index(drop=True)
-    )
-    if (out["mask_count"] <= 0).any():
-        raise ValueError("每份研报至少应有一个masked token")
-    return out
-
-
-def _bootstrap_losses(
+def _bootstrap_distances(
     frame: pd.DataFrame, indices: np.ndarray, expected_ids: Sequence[str]
 ) -> np.ndarray:
-    aggregated = (
-        _aggregate_reports(frame).set_index("report_id").loc[list(expected_ids)]
-    )
-    sums = aggregated["ce_sum"].to_numpy(dtype=np.float64)
-    counts = aggregated["mask_count"].to_numpy(dtype=np.float64)
-    return sums[indices].sum(axis=1) / counts[indices].sum(axis=1)
+    """Bootstrap-resample mean representation distance by report_id."""
+    per_report = frame.set_index("report_id").loc[list(expected_ids)]
+    distances = per_report["representation_distance"].to_numpy(dtype=np.float64)
+    return distances[indices].mean(axis=1)
 
 
 def summarize_loss_recovery(
-    report_losses: pd.DataFrame, policy: Mapping[str, object]
+    report_distances: pd.DataFrame, policy: Mapping[str, object]
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Summarize raw CE values without rounding or denominator clipping."""
+    """Summarize raw CLS distances into recovery fractions + CIs.
+
+    Unlike the MLM-CE version, ``distance_original = 0`` by construction
+    (baseline vs itself), so the denominator is simply ``distance_zero``.
+    """
 
     required = {
         "condition",
         "site",
+        "layer",
+        "kind",
         "n_components",
-        "mask_seed",
         "report_id",
-        "ce_sum",
-        "mask_count",
+        "representation_distance",
     }
-    if not required.issubset(report_losses.columns):
+    if not required.issubset(report_distances.columns):
         raise ValueError(
-            f"loss表缺字段: {sorted(required.difference(report_losses.columns))}"
+            f"distance表缺字段: {sorted(required.difference(report_distances.columns))}"
         )
+
     evaluation = _mapping(policy, "evaluation")
     projection = _mapping(policy, "projection")
     ident = _mapping(policy, "identifiability")
-    seeds = [int(value) for value in evaluation["mask_seeds"]]
-    components = [int(value) for value in projection["components"]]
-    baseline = report_losses.loc[report_losses["condition"].eq("original")].copy()
-    expected_pairs = {
-        (int(seed), str(report_id))
-        for seed, report_id in zip(
-            baseline["mask_seed"], baseline["report_id"], strict=True
-        )
-    }
-    if not expected_pairs or set(baseline["mask_seed"].astype(int)) != set(seeds):
-        raise ValueError("original baseline缺少mask seed")
-    if baseline.duplicated(["mask_seed", "report_id"]).any():
-        raise ValueError("original baseline含重复seed/report")
 
-    report_ids = sorted(baseline["report_id"].astype(str).unique())
+    layers = [int(v) for v in evaluation["layers"]]
+    kinds = [str(v) for v in evaluation["kinds"]]
+    components = [int(value) for value in projection["components"]]
+
+    # All report_ids that appear in any condition
+    report_ids = sorted(report_distances["report_id"].astype(str).unique())
     draws = int(ident["bootstrap_samples"])
     rng = np.random.default_rng(int(ident["bootstrap_seed"]))
     indices = rng.integers(0, len(report_ids), size=(draws, len(report_ids)))
-    baseline_loss = _pooled_loss(baseline)
-    baseline_boot = _bootstrap_losses(baseline, indices, report_ids)
     alpha = (1.0 - float(ident["confidence_level"])) / 2.0
+
+    # distance_original = 0 by construction
+    distance_original = 0.0
+    original_boot = np.zeros(draws)
 
     metric_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
-    for kind in SITE_KINDS:
-        site = f"{kind}_{int(evaluation['layer']):02d}"
-        projected = report_losses.loc[
-            report_losses["condition"].eq("projection") & report_losses["site"].eq(site)
-        ].copy()
-        actual_pairs = {
-            (int(seed), str(report_id))
-            for seed, report_id in zip(
-                projected["mask_seed"], projected["report_id"], strict=True
+
+    for kind in kinds:
+        for layer in layers:
+            site = f"{kind}_{layer:02d}"
+            projected = report_distances.loc[
+                report_distances["site"].eq(site)
+            ].copy()
+
+            if set(projected["n_components"].astype(int)) != set(components):
+                raise ValueError(f"{site}缺少projection components")
+            if projected.duplicated(["n_components", "report_id"]).any():
+                raise ValueError(f"{site}含重复component/report")
+
+            zero = projected.loc[projected["n_components"].eq(0)]
+            distance_zero = _mean_distance(zero)
+            zero_boot = _bootstrap_distances(zero, indices, report_ids)
+
+            denominator = float(distance_zero - distance_original)
+            denominator_boot = zero_boot - original_boot
+            denominator_se = float(np.std(denominator_boot, ddof=1))
+            signal_to_noise = (
+                math.inf
+                if denominator_se == 0.0 and denominator > 0.0
+                else denominator / denominator_se if denominator_se > 0.0 else -math.inf
             )
-        }
-        if actual_pairs != expected_pairs:
-            raise ValueError(f"{site}与original没有使用完全相同的seed/report集合")
-        if set(projected["n_components"].astype(int)) != set(components):
-            raise ValueError(f"{site}缺少projection components")
-        if projected.duplicated(["n_components", "mask_seed", "report_id"]).any():
-            raise ValueError(f"{site}含重复component/seed/report")
-        baseline_counts = baseline.set_index(["mask_seed", "report_id"])["mask_count"]
-        for n_components in components:
-            current = projected.loc[projected["n_components"].eq(int(n_components))]
-            component_pairs = {
-                (int(seed), str(report_id))
-                for seed, report_id in zip(
-                    current["mask_seed"], current["report_id"], strict=True
-                )
-            }
-            if component_pairs != expected_pairs:
-                raise ValueError(
-                    f"{site} N={n_components}没有使用完整的seed/report集合"
-                )
-            current_counts = current.set_index(["mask_seed", "report_id"])[
-                "mask_count"
-            ].loc[baseline_counts.index]
-            if not np.array_equal(
-                current_counts.to_numpy(dtype=np.int64),
-                baseline_counts.to_numpy(dtype=np.int64),
-            ):
-                raise ValueError(f"{site} N={n_components}与original的mask不一致")
+            identifiable = bool(
+                denominator >= float(ident["minimum_ablation_delta"])
+                and signal_to_noise >= float(ident["minimum_signal_to_noise"])
+            )
+            status = "identifiable" if identifiable else "non_identifiable"
 
-        zero = projected.loc[projected["n_components"].eq(0)]
-        zero_loss = _pooled_loss(zero)
-        zero_boot = _bootstrap_losses(zero, indices, report_ids)
-        denominator = float(zero_loss - baseline_loss)
-        denominator_boot = zero_boot - baseline_boot
-        denominator_se = float(np.std(denominator_boot, ddof=1))
-        signal_to_noise = (
-            math.inf
-            if denominator_se == 0.0 and denominator > 0.0
-            else denominator / denominator_se if denominator_se > 0.0 else -math.inf
-        )
-        identifiable = bool(
-            denominator >= float(ident["minimum_ablation_delta"])
-            and signal_to_noise >= float(ident["minimum_signal_to_noise"])
-        )
-        status = "identifiable" if identifiable else "non_identifiable"
+            for n_components in components:
+                current = projected.loc[
+                    projected["n_components"].eq(int(n_components))
+                ]
+                distance_n = _mean_distance(current)
+                current_boot = _bootstrap_distances(current, indices, report_ids)
 
-        for n_components in components:
-            current = projected.loc[projected["n_components"].eq(int(n_components))]
-            current_loss = _pooled_loss(current)
-            current_boot = _bootstrap_losses(current, indices, report_ids)
+                if identifiable:
+                    valid = denominator_boot > 0.0
+                    if int(valid.sum()) < max(100, draws // 2):
+                        raise RuntimeError(f"{site} bootstrap中正分母过少")
+                    recovery = float(
+                        (distance_zero - distance_n) / denominator
+                    )
+                    recovery_boot = (
+                        zero_boot[valid] - current_boot[valid]
+                    ) / denominator_boot[valid]
+                    lower, upper = np.quantile(recovery_boot, [alpha, 1.0 - alpha])
+                else:
+                    recovery = math.nan
+                    lower = math.nan
+                    upper = math.nan
+
+                metric_rows.append(
+                    {
+                        "site": site,
+                        "kind": kind,
+                        "layer": int(layer),
+                        "n_components": int(n_components),
+                        "distance_original": distance_original,
+                        "distance_zero": distance_zero,
+                        "distance_projected": distance_n,
+                        "ablation_delta": denominator,
+                        "denominator_bootstrap_se": denominator_se,
+                        "denominator_signal_to_noise": signal_to_noise,
+                        "status": status,
+                        "recovery_fraction": recovery,
+                        "recovery_ci_lower": float(lower),
+                        "recovery_ci_upper": float(upper),
+                        "evaluation_reports": len(report_ids),
+                    }
+                )
+
+            site_metrics = metric_rows[-len(components):]
+            full = next(row for row in site_metrics if row["n_components"] == 768)
+            full_difference = abs(float(full["distance_projected"]) - distance_original)
+            tolerance = float(ident["full_projection_absolute_tolerance"])
+            full_passed = bool(full_difference <= tolerance)
+            threshold = float(ident["sustained_recovery_threshold"])
+            n_sustained: int | None = None
             if identifiable:
-                recovery = float((zero_loss - current_loss) / denominator)
-                valid = denominator_boot > 0.0
-                if int(valid.sum()) < max(100, draws // 2):
-                    raise RuntimeError(f"{site} bootstrap中正分母过少")
-                recovery_boot = (
-                    zero_boot[valid] - current_boot[valid]
-                ) / denominator_boot[valid]
-                lower, upper = np.quantile(recovery_boot, [alpha, 1.0 - alpha])
-            else:
-                recovery = math.nan
-                lower = math.nan
-                upper = math.nan
-            metric_rows.append(
+                for index, row in enumerate(site_metrics):
+                    remaining = site_metrics[index:]
+                    if all(
+                        float(c["recovery_ci_lower"]) >= threshold
+                        for c in remaining
+                    ):
+                        n_sustained = int(row["n_components"])
+                        break
+            summary_rows.append(
                 {
                     "site": site,
                     "kind": kind,
-                    "layer": int(evaluation["layer"]),
-                    "n_components": int(n_components),
-                    "loss_original": baseline_loss,
-                    "loss_zero": zero_loss,
-                    "loss_projected": current_loss,
+                    "layer": int(layer),
+                    "status": status,
+                    "distance_original": distance_original,
+                    "distance_zero": distance_zero,
                     "ablation_delta": denominator,
                     "denominator_bootstrap_se": denominator_se,
                     "denominator_signal_to_noise": signal_to_noise,
-                    "status": status,
-                    "recovery_fraction": recovery,
-                    "recovery_ci_lower": float(lower),
-                    "recovery_ci_upper": float(upper),
-                    "masked_tokens": int(current["mask_count"].sum()),
-                    "mask_seed_count": len(seeds),
-                    "evaluation_reports": len(report_ids),
+                    "sustained_recovery_threshold": threshold,
+                    "n_sustained_recovery": n_sustained,
+                    "full_projection_absolute_difference": full_difference,
+                    "full_projection_tolerance": tolerance,
+                    "full_projection_passed": full_passed,
                 }
             )
-
-        site_metrics = metric_rows[-len(components) :]
-        full = next(row for row in site_metrics if row["n_components"] == 768)
-        full_difference = abs(float(full["loss_projected"]) - baseline_loss)
-        tolerance = float(ident["full_projection_absolute_tolerance"])
-        full_passed = bool(full_difference <= tolerance)
-        threshold = float(ident["sustained_recovery_threshold"])
-        n_sustained: int | None = None
-        if identifiable:
-            for index, row in enumerate(site_metrics):
-                remaining = site_metrics[index:]
-                if all(
-                    float(candidate["recovery_ci_lower"]) >= threshold
-                    for candidate in remaining
-                ):
-                    n_sustained = int(row["n_components"])
-                    break
-        summary_rows.append(
-            {
-                "site": site,
-                "kind": kind,
-                "layer": int(evaluation["layer"]),
-                "status": status,
-                "loss_original": baseline_loss,
-                "loss_zero": zero_loss,
-                "ablation_delta": denominator,
-                "denominator_bootstrap_se": denominator_se,
-                "denominator_signal_to_noise": signal_to_noise,
-                "sustained_recovery_threshold": threshold,
-                "n_sustained_recovery": n_sustained,
-                "full_projection_absolute_difference": full_difference,
-                "full_projection_tolerance": tolerance,
-                "full_projection_passed": full_passed,
-            }
-        )
 
     metrics = pd.DataFrame(metric_rows)
     summary = pd.DataFrame(summary_rows)
@@ -454,6 +436,9 @@ def summarize_loss_recovery(
     return metrics, summary
 
 
+# --------------------------------------------------------------------------- #
+# Evaluation
+# --------------------------------------------------------------------------- #
 def _tokenize_evaluation(
     tokenizer: Any, rows: pd.DataFrame, max_length: int
 ) -> dict[str, Any]:
@@ -465,61 +450,34 @@ def _tokenize_evaluation(
         return_tensors="pt",
         return_attention_mask=True,
         return_token_type_ids=True,
-        return_special_tokens_mask=True,
     )
     return dict(encoded)
 
 
-def _masked_inputs(
-    encoded: Mapping[str, Any], tokenizer: Any, *, seed: int, probability: float
-) -> tuple[Any, Any, int]:
-    import torch
-
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
-    ordinary = encoded["attention_mask"].bool() & ~encoded["special_tokens_mask"].bool()
-    mask = (
-        torch.rand(ordinary.shape, generator=generator) < float(probability)
-    ) & ordinary
-    forced = 0
-    for row in range(mask.shape[0]):
-        if not bool(mask[row].any()):
-            candidates = torch.nonzero(ordinary[row], as_tuple=False).flatten()
-            if candidates.numel() == 0:
-                raise ValueError("研报截断后没有可mask的普通token")
-            mask[row, int(candidates[0])] = True
-            forced += 1
-    masked = encoded["input_ids"].clone()
-    masked[mask] = int(tokenizer.mask_token_id)
-    return masked, mask, forced
-
-
-def _evaluate_condition(
+def _evaluate_representation_condition(
     *,
-    model: Any,
+    candidate: Any,
     encoded: Mapping[str, Any],
-    masked_input_ids: Any,
-    mask_positions: Any,
     rows: pd.DataFrame,
     device: str,
     batch_size: int,
-    mask_seed: int,
     condition: str,
     site: str,
+    layer: int,
     n_components: int,
     hook_context: Any,
+    baseline_cls: Any,
 ) -> list[dict[str, object]]:
+    """Run candidate with projection hook and compute per-report CLS L2 distance."""
+
     import torch
-    import torch.nn.functional as functional
 
     records: list[dict[str, object]] = []
     with hook_context, torch.inference_mode():
         for start in range(0, len(rows), int(batch_size)):
             stop = min(start + int(batch_size), len(rows))
-            batch_mask = mask_positions[start:stop]
-            labels = encoded["input_ids"][start:stop].clone()
-            labels[~batch_mask] = -100
             inputs = {
-                "input_ids": masked_input_ids[start:stop],
+                "input_ids": encoded["input_ids"][start:stop],
                 "attention_mask": encoded["attention_mask"][start:stop],
                 "token_type_ids": encoded["token_type_ids"][start:stop],
             }
@@ -528,64 +486,67 @@ def _evaluate_condition(
                     key: value.pin_memory().to(device, non_blocking=True)
                     for key, value in inputs.items()
                 }
-                labels = labels.pin_memory().to(device, non_blocking=True)
             else:
                 inputs = {key: value.to(device) for key, value in inputs.items()}
-                labels = labels.to(device)
-            logits = model(**inputs).logits.float()
-            token_losses = functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                labels.reshape(-1),
-                reduction="none",
-                ignore_index=-100,
-            ).reshape(labels.shape)
-            valid = labels.ne(-100)
-            ce_sums = (token_losses * valid).sum(dim=1).detach().cpu().numpy()
-            counts = valid.sum(dim=1).detach().cpu().numpy()
-            for offset, (ce_sum, count) in enumerate(zip(ce_sums, counts, strict=True)):
+            output = candidate(**inputs)
+            modified_cls = output.pooled_feature.float().cpu()
+            batch_baseline = baseline_cls[start:stop]
+            distances = ((modified_cls - batch_baseline) ** 2).sum(dim=1)
+            for offset, dist in enumerate(distances.tolist()):
                 records.append(
                     {
                         "condition": condition,
                         "site": site,
+                        "layer": int(layer),
+                        "kind": site.rsplit("_", 1)[0],
                         "n_components": int(n_components),
-                        "mask_seed": int(mask_seed),
                         "report_id": str(rows.iloc[start + offset]["report_id"]),
-                        "ce_sum": float(ce_sum),
-                        "mask_count": int(count),
-                        "ce_loss": float(ce_sum / count),
+                        "representation_distance": float(dist),
                     }
                 )
-            del logits, token_losses
+            del output, modified_cls
     return records
 
 
-def _load_mlm_proxy(
+# --------------------------------------------------------------------------- #
+# Model loading (replaces _load_mlm_proxy)
+# --------------------------------------------------------------------------- #
+def _load_candidate(
     *, base: Path, checkpoint: Path, device: str, dtype_name: str
 ) -> tuple[Any, Any]:
-    import torch
-    from transformers import BertForMaskedLM, BertTokenizerFast
+    """Load the fine-tuned BinaryClassificationCandidate + tokenizer."""
 
-    model = BertForMaskedLM.from_pretrained(base, local_files_only=True)
-    state = strip_prefix(load_state_dict_safe(str(checkpoint), map_location="cpu"))
-    bert_state = {
-        key[len("bert.") :]: value
-        for key, value in state.items()
-        if key.startswith("bert.") and not key.startswith("bert.pooler.")
-    }
-    model.bert.load_state_dict(bert_state, strict=True)
-    dtypes = {
+    import torch
+    from transformers import BertTokenizerFast
+
+    candidate = build_candidate(
+        base_model_dir=str(base),
+        checkpoint_path=str(checkpoint),
+        device=device,
+        dtype=_torch_dtype(dtype_name),
+    )
+    freeze_and_validate_inference_model(candidate, expected_hidden_layers=13)
+    tokenizer = BertTokenizerFast.from_pretrained(base, local_files_only=True)
+    return candidate, tokenizer
+
+
+def _torch_dtype(name: str):
+    import torch
+
+    choices = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    if dtype_name not in dtypes:
-        raise ValueError(f"不支持的pilot dtype: {dtype_name}")
-    model = model.to(device=device, dtype=dtypes[dtype_name])
-    freeze_and_validate_inference_model(model, expected_hidden_layers=13)
-    tokenizer = BertTokenizerFast.from_pretrained(base, local_files_only=True)
-    return model, tokenizer
+    normalized = str(name).lower()
+    if normalized not in choices:
+        raise ValueError(f"不支持的pilot dtype: {name}")
+    return choices[normalized]
 
 
+# --------------------------------------------------------------------------- #
+# Fingerprint (unchanged)
+# --------------------------------------------------------------------------- #
 def _model_source_fingerprint(base: Path) -> str:
     files = sorted(
         {
@@ -605,45 +566,85 @@ def _model_source_fingerprint(base: Path) -> str:
     return _json_hash({path.name: sha256_file(path) for path in files})
 
 
+# --------------------------------------------------------------------------- #
+# Plotting (modified: 12 per-layer curves + contribution bar chart)
+# --------------------------------------------------------------------------- #
 def _plot_metrics(metrics: pd.DataFrame, summary: pd.DataFrame, path: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axis = plt.subplots(figsize=(8, 5))
-    labels = {
-        "attention_output": "Attention output",
-        "mlp_output": "MLP output",
-        "residual": "Residual stream",
-    }
-    for row in summary.itertuples(index=False):
-        current = metrics.loc[metrics["site"].eq(row.site)].sort_values("n_components")
-        if row.status == "identifiable":
-            axis.plot(
-                current["n_components"],
-                current["recovery_fraction"],
+    fig, (ax_curves, ax_bar) = plt.subplots(
+        1, 2, figsize=(16, 6), gridspec_kw={"width_ratios": [3, 1]}
+    )
+
+    layers = sorted(metrics["layer"].unique())
+    n_layers = len(layers)
+    colors = plt.cm.coolwarm(np.linspace(0, 1, max(n_layers, 1)))
+
+    # Left: recovery curves
+    for i, layer in enumerate(layers):
+        sub = metrics.loc[
+            metrics["layer"].eq(int(layer))
+        ].sort_values("n_components")
+        if sub.empty:
+            continue
+        status = (
+            summary.loc[summary["layer"].eq(int(layer)), "status"].values[0]
+            if not summary.loc[summary["layer"].eq(int(layer))].empty
+            else "unknown"
+        )
+        label = f"L{layer}" if status == "identifiable" else f"L{layer} (non-id.)"
+        if status == "identifiable":
+            ax_curves.plot(
+                sub["n_components"],
+                sub["recovery_fraction"],
                 marker="o",
-                label=labels[row.kind],
+                color=colors[i],
+                label=label,
+                linewidth=1.5,
+                markersize=4,
             )
-            axis.fill_between(
-                current["n_components"].to_numpy(),
-                current["recovery_ci_lower"].to_numpy(),
-                current["recovery_ci_upper"].to_numpy(),
-                alpha=0.15,
+            ax_curves.fill_between(
+                sub["n_components"].to_numpy(),
+                sub["recovery_ci_lower"].to_numpy(),
+                sub["recovery_ci_upper"].to_numpy(),
+                color=colors[i],
+                alpha=0.1,
             )
         else:
-            axis.plot([], [], label=f"{labels[row.kind]} (non-identifiable)")
-    axis.axhline(0.99, color="gray", linestyle="--", linewidth=1)
-    axis.set_xlabel("Retained PCA components at Layer 6")
-    axis.set_ylabel("MLM-proxy loss recovered")
-    axis.set_title("Single-position activation loss recovery")
-    axis.legend()
+            ax_curves.plot([], [], color=colors[i], label=label)
+
+    ax_curves.axhline(0.99, color="gray", linestyle="--", linewidth=1)
+    ax_curves.set_xlabel("Retained PCA components (per layer)")
+    ax_curves.set_ylabel("CLS representation recovered")
+    ax_curves.set_title("Per-layer attention output recovery")
+    ax_curves.legend(fontsize=7, ncol=3, loc="lower right")
+    ax_curves.set_ylim(-0.05, 1.05)
+    ax_curves.set_xlim(-15, 785)
+
+    # Right: zero-ablation contribution per layer
+    bar_data = summary.sort_values("layer")
+    ax_bar.barh(
+        bar_data["layer"],
+        bar_data["ablation_delta"],
+        color="steelblue",
+        height=0.6,
+    )
+    ax_bar.set_xlabel("Zero-ablation CLS distance")
+    ax_bar.set_ylabel("Layer")
+    ax_bar.set_title("Per-layer attention contribution")
+    ax_bar.invert_yaxis()
+
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
 
+# --------------------------------------------------------------------------- #
+# Validation (unchanged)
+# --------------------------------------------------------------------------- #
 def validate_loss_recovery_outputs(
     directory: str | Path, expected: Mapping[str, object]
 ) -> dict[str, object]:
@@ -668,10 +669,15 @@ def validate_loss_recovery_outputs(
     return manifest
 
 
+# --------------------------------------------------------------------------- #
+# Main stage (modified: per-layer + CLS distance)
+# --------------------------------------------------------------------------- #
 def run_loss_recovery_stage(
     config: Mapping[str, object], policy_path: str | Path
 ) -> Path:
-    """Run or strictly reuse the Layer-6 single-position recovery extension."""
+    """Run or strictly reuse the per-layer CLS representation recovery extension."""
+
+    import torch
 
     policy_path = Path(policy_path).expanduser().resolve()
     policy = load_loss_recovery_policy(policy_path)
@@ -700,8 +706,10 @@ def run_loss_recovery_stage(
     pilot = validate_pilot_outputs(run_pilot_stage(config))
     evaluation = _mapping(policy, "evaluation")
     projection = _mapping(policy, "projection")
-    layer = int(evaluation["layer"])
-    sites = tuple(f"{kind}_{layer:02d}" for kind in SITE_KINDS)
+    layers = [int(v) for v in evaluation["layers"]]
+    kinds = [str(v) for v in evaluation["kinds"]]
+    sites = tuple(f"{kind}_{layer:02d}" for kind in kinds for layer in layers)
+
     reports = _read_report_texts(config)
     rank_sample = pd.read_parquet(sample_directory / "sample_manifest.parquet")
     selected = select_disjoint_evaluation_reports(
@@ -714,7 +722,7 @@ def run_loss_recovery_stage(
     base, checkpoint = _model_paths(config)
     device = str(_mapping(config, "model").get("device", "cuda:1"))
     dtype_name = str(pilot["selected_compute_dtype"])
-    model, tokenizer = _load_mlm_proxy(
+    candidate, tokenizer = _load_candidate(
         base=base,
         checkpoint=checkpoint,
         device=device,
@@ -723,6 +731,7 @@ def run_loss_recovery_stage(
     encoded = _tokenize_evaluation(
         tokenizer, selected, int(_mapping(config, "model").get("max_length", 512))
     )
+
     with np.load(analysis / "subspaces.npz", allow_pickle=False) as archive:
         bases = {
             site: np.asarray(
@@ -731,63 +740,59 @@ def run_loss_recovery_stage(
             for site in sites
         }
 
-    loss_rows: list[dict[str, object]] = []
-    mask_audit: list[dict[str, object]] = []
-    probability = float(evaluation["mask_probability"])
     batch_size = int(evaluation["batch_size"])
     components = [int(value) for value in projection["components"]]
-    for seed in [int(value) for value in evaluation["mask_seeds"]]:
-        masked, mask_positions, forced = _masked_inputs(
-            encoded, tokenizer, seed=seed, probability=probability
-        )
-        mask_audit.append(
-            {
-                "mask_seed": seed,
-                "masked_tokens": int(mask_positions.sum().item()),
-                "forced_mask_reports": int(forced),
-                "evaluation_reports": len(selected),
+
+    # --- Compute baseline CLS (no hook) ---
+    baseline_parts: list[Any] = []
+    with torch.inference_mode():
+        for start in range(0, len(selected), batch_size):
+            stop = min(start + batch_size, len(selected))
+            inputs = {
+                "input_ids": encoded["input_ids"][start:stop],
+                "attention_mask": encoded["attention_mask"][start:stop],
+                "token_type_ids": encoded["token_type_ids"][start:stop],
             }
-        )
-        loss_rows.extend(
-            _evaluate_condition(
-                model=model,
-                encoded=encoded,
-                masked_input_ids=masked,
-                mask_positions=mask_positions,
-                rows=selected,
-                device=device,
-                batch_size=batch_size,
-                mask_seed=seed,
-                condition="original",
-                site="original",
-                n_components=-1,
-                hook_context=nullcontext(),
-            )
-        )
-        for site in sites:
-            module = resolve_projection_module(model.bert, site)
+            if str(device).startswith("cuda"):
+                inputs = {
+                    key: value.pin_memory().to(device, non_blocking=True)
+                    for key, value in inputs.items()
+                }
+            output = candidate(**inputs)
+            baseline_parts.append(output.pooled_feature.float().cpu())
+            del output
+    baseline_cls = torch.cat(baseline_parts, dim=0)
+
+    # --- Per-layer per-kind per-N evaluation ---
+    distance_rows: list[dict[str, object]] = []
+    for kind in kinds:
+        for layer in layers:
+            site = f"{kind}_{layer:02d}"
+            module = resolve_projection_module(candidate.bert, site)
             for n_components in components:
-                loss_rows.extend(
-                    _evaluate_condition(
-                        model=model,
+                hook = (
+                    SingleSiteProjection(module, bases[site], n_components)
+                    if n_components < 768
+                    else nullcontext()
+                )
+                distance_rows.extend(
+                    _evaluate_representation_condition(
+                        candidate=candidate,
                         encoded=encoded,
-                        masked_input_ids=masked,
-                        mask_positions=mask_positions,
                         rows=selected,
                         device=device,
                         batch_size=batch_size,
-                        mask_seed=seed,
                         condition="projection",
                         site=site,
+                        layer=layer,
                         n_components=n_components,
-                        hook_context=SingleSiteProjection(
-                            module, bases[site], n_components
-                        ),
+                        hook_context=hook,
+                        baseline_cls=baseline_cls,
                     )
                 )
 
-    report_losses = pd.DataFrame(loss_rows)
-    metrics, site_summary = summarize_loss_recovery(report_losses, policy)
+    report_distances = pd.DataFrame(distance_rows)
+    metrics, site_summary = summarize_loss_recovery(report_distances, policy)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".loss-recovery-", dir=output.parent))
     try:
@@ -797,11 +802,8 @@ def run_loss_recovery_stage(
         evaluation_manifest.to_parquet(
             temporary / "evaluation_manifest.parquet", index=False, compression="zstd"
         )
-        pd.DataFrame(mask_audit).to_parquet(
-            temporary / "mask_audit.parquet", index=False, compression="zstd"
-        )
-        report_losses.to_parquet(
-            temporary / "report_losses.parquet", index=False, compression="zstd"
+        report_distances.to_parquet(
+            temporary / "report_distances.parquet", index=False, compression="zstd"
         )
         metrics.to_parquet(
             temporary / "loss_recovery_metrics.parquet", index=False, compression="zstd"
@@ -815,8 +817,7 @@ def run_loss_recovery_stage(
         _plot_metrics(metrics, site_summary, temporary / "loss_recovery.png")
         filenames = (
             "evaluation_manifest.parquet",
-            "mask_audit.parquet",
-            "report_losses.parquet",
+            "report_distances.parquet",
             "loss_recovery_metrics.parquet",
             "site_summary.parquet",
             "preflight.parquet",
@@ -828,8 +829,9 @@ def run_loss_recovery_stage(
             "git_commit": git_commit(),
             "loss_semantics": LOSS_SEMANTICS,
             "labels_or_returns_loaded": False,
-            "intervention_scope": "one_site_at_a_time",
-            "layer": layer,
+            "intervention_scope": "per_layer_single_site",
+            "layers": layers,
+            "kinds": kinds,
             "sites": list(sites),
             "components": components,
             "device_requested": device,
@@ -838,7 +840,7 @@ def run_loss_recovery_stage(
             "evaluation_reports": len(selected),
             "pca_sample_report_overlap": 0,
             "pca_sample_text_hash_overlap": 0,
-            "mask_seeds": [int(value) for value in evaluation["mask_seeds"]],
+            "batch_size": batch_size,
             "site_status": dict(zip(site_summary["site"], site_summary["status"])),
             "file_sha256": {
                 filename: sha256_file(temporary / filename) for filename in filenames

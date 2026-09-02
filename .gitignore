@@ -89,3 +89,4 @@ dist/
 .vscode/
 *.swp
 *~
+/_*.json

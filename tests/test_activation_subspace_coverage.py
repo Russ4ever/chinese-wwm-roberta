@@ -145,6 +145,10 @@ def test_orthogonal_layers_cumulative_growth():
     eigvals_m3 = np.linalg.eigvalsh(np.mean(projectors, axis=0))[::-1]
     summary_m1 = coverage_summary_row(eigvals_m1)
     summary_m3 = coverage_summary_row(eigvals_m3)
-    # 3 disjoint 64-dim subspaces: 192 directions covered, effective rank should be ~192
+    # 3 disjoint subspaces: 192 dirs with eigenvalue 1/3, 576 with 0
+    # effective rank should grow (64 -> ~192), more low-coverage dirs
     assert summary_m3["effective_coverage_rank"] > summary_m1["effective_coverage_rank"]
-    assert summary_m3["directions_coverage_above_090"] == 192
+    # 1/3 ≈ 0.33 < 0.50, so no directions reach 0.50
+    assert summary_m3["directions_coverage_above_050"] == 0
+    # 576 zero-eigenvalue directions are below 0.05
+    assert summary_m3["directions_coverage_below_005"] == HIDDEN_DIM - 192

@@ -24,7 +24,7 @@ inference:
 identifiability:
   # A recovery fraction is reported only if zero ablation causes a stable,
   # positive representation change. Both conditions below must pass.
-  minimum_ablation_delta: 0.0
+  minimum_ablation_delta: 0.001
   minimum_signal_to_noise: 3.0
   bootstrap_samples: 2000
   bootstrap_seed: 20260901

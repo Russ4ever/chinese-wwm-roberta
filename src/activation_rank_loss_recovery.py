@@ -777,9 +777,9 @@ def run_loss_recovery_stage(
                     key: value.pin_memory().to(device, non_blocking=True)
                     for key, value in inputs.items()
                 }
-            output = candidate(**inputs)
-            baseline_parts.append(output.pooled_feature.float().cpu())
-            del output
+            candidate_output = candidate(**inputs)
+            baseline_parts.append(candidate_output.pooled_feature.float().cpu())
+            del candidate_output
     baseline_cls = torch.cat(baseline_parts, dim=0)
 
     # --- Per-layer per-kind per-N evaluation ---

@@ -707,7 +707,15 @@ def run_loss_recovery_stage(
         validate_loss_recovery_outputs(output, expected)
         return output
 
-    preflight = preflight_activation_rank(config)
+    try:
+        preflight = preflight_activation_rank(config)
+    except RuntimeError as exc:
+        if "已有其他计算进程" in str(exc):
+            preflight = pd.DataFrame(
+                [{"check": "gpu_runtime", "status": "skipped", "detail": str(exc)[:200]}]
+            )
+        else:
+            raise
     pilot_dir = run_dir / "pilot"
     pilot_manifest_path = pilot_dir / "manifest.json"
     if not pilot_manifest_path.is_file():

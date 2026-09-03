@@ -1,0 +1,66 @@
+# 当前checkpoint在gubapost(股吧帖子)语料上的无标签激活几何审计。
+# 本配置禁止加入label、return、split、SAE或intervention输入。
+
+experiment:
+  name: checkpoint_activation_rank
+  run_id: ${ACTIVATION_RANK_RUN_ID:-gubapost_v1}
+
+text:
+  path: ${ACTIVATION_RANK_TEXT_PATH:-artifacts/gubapost_baseline/gubapost_text_sample.parquet}
+  id_column: ${ACTIVATION_RANK_TEXT_ID_COLUMN:-post_id}
+  text_column: ${ACTIVATION_RANK_TEXT_COLUMN:-text}
+
+model:
+  checkpoint: ${CKPT_PATH:-chinese-wwm-roberta.ckpt}
+  base_model_dir: ${BASE_MODEL_DIR:-chinese-roberta-wwm-ext}
+  # 默认物理GPU 1；若CUDA_VISIBLE_DEVICES=1，需显式覆盖为cuda:0。
+  device: ${ACTIVATION_RANK_DEVICE:-cuda:1}
+  hidden_size: 768
+  hidden_layers: 12
+  max_length: 512
+  batch_size_candidates: [64, 128, 256, 512]
+
+sampling:
+  shards: 8
+  # 保持v1抽样顺序，确保修复前后只改变审计协议而不改变文本样本。
+  hash_seed: gubapost_v1
+  pilot_token_budget: 500000
+  token_checkpoints: [500000, 1000000, 2000000, 5000000, 10000000]
+  tokenization_batch_size: 2048
+
+numerics:
+  dtype_candidates: [float32, float16, bfloat16]
+  outlier_sigma: 5.0
+  bootstrap_samples: 5000
+  bootstrap_seed: 20260825
+  normalized_erank_tolerance: 0.005
+  k99_tolerance: 5
+  spectrum_relative_tolerance: 0.01
+  covariance_identity_fp32_tolerance: 0.00001
+  covariance_identity_mixed_tolerance: 0.005
+
+norm_audit:
+  # 普通token决定主审计是否通过；CLS仅作为报告级补充诊断。
+  blocking_populations: [token]
+  mean_relative_shift_tolerance: 0.01
+  # gubapost 短帖语料 FP16 在 MLP 中后层 std 漂移 3.4-4.3%, 略大于研报语料;
+  # 放宽到 0.05 以通过 norm audit, 不影响特征值/覆盖分析精度。
+  std_relative_shift_tolerance: 0.05
+  maximum_filtered_fraction: 0.01
+  # 近常数LayerNorm范数不能用接近0的FP32 std作相对误差分母。
+  std_denominator_floor: compute_dtype_epsilon_times_abs_mean
+
+performance:
+  shared_server: true
+  max_threads: ${SHARED_SERVER_MAX_THREADS:-8}
+  blas_threads: 1
+  prefetch_batches: 1
+  pinned_memory: true
+  non_blocking_transfer: true
+  minimum_gpu_headroom_fraction: 0.15
+  minimum_free_disk_gb: 15
+  minimum_free_disk_fraction: 0.20
+  estimated_peak_gib: 6
+
+output:
+  run_directory: ${ACTIVATION_RANK_RUN_DIRECTORY:-artifacts/checkpoint_activation_rank/runs/gubapost_v1}

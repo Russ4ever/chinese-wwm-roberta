@@ -179,12 +179,15 @@ class BinaryClassificationCandidate(nn.Module):
         )
 
 
-def load_backbone(base_model_dir: str) -> "BertModel":
-    """从本地配置构造 BertModel；权重随后由项目 checkpoint 严格加载。"""
+def load_backbone(base_model_dir: str, attn_implementation: str = "eager") -> "BertModel":
+    """从本地配置构造 BertModel；权重随后由项目 checkpoint 严格加载。
+
+    attn_implementation: "eager"(默认, hook 兼容) | "sdpa"(纯前向加速, A100 走 flash attention)
+    """
     from transformers import BertConfig, BertModel
 
     config = BertConfig.from_pretrained(base_model_dir, local_files_only=True)
-    config._attn_implementation = "eager"  # transformers 的公开参数暂无构造器入口
+    config._attn_implementation = attn_implementation
     config.return_dict = True
     return BertModel(config)
 
@@ -197,13 +200,15 @@ def build_candidate(
     model_hash: Optional[str] = None,
     device: Union[str, torch.device] = "cpu",
     dtype: torch.dtype = torch.float32,
+    attn_implementation: str = "eager",
 ) -> BinaryClassificationCandidate:
     """构建完整二分类推理候选。
 
     - backbone 以 strict=True 从 ckpt 的 ``bert.*`` 键加载；
     - fc 从 ckpt 的 ``fc.weight/fc.bias`` 加载。
+    - attn_implementation="sdpa" 用于纯前向 CLS 提取(flash attention 加速, 不需要 hook)。
     """
-    bert = load_backbone(base_model_dir)
+    bert = load_backbone(base_model_dir, attn_implementation=attn_implementation)
     state = strip_prefix(load_state_dict_safe(checkpoint_path, map_location="cpu"))
     backbone = {k[len("bert."):]: v for k, v in state.items() if k.startswith("bert.")}
     if not backbone:

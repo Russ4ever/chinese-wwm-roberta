@@ -2,8 +2,8 @@
 import json
 from pathlib import Path
 
-NB = Path("notebooks/train_subspace_fc_heads.ipynb")
-with open(NB.open("r", encoding="utf-8")) as f:
+NB = "notebooks/train_subspace_fc_heads.ipynb"
+with open(NB, "r", encoding="utf-8") as f:
     nb = json.load(f)
 
 # Cell 1 (index 1): replace mean_cls with sum_cls_feat
@@ -37,7 +37,7 @@ for c in nb["cells"]:
         c["outputs"] = []
         c["execution_count"] = None
 
-with open(NB.open("w", encoding="utf-8")) as f:
+with open(NB, "w", encoding="utf-8") as f:
     json.dump(nb, f, ensure_ascii=False, indent=1)
 
 # Verify

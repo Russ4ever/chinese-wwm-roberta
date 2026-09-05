@@ -90,3 +90,6 @@ dist/
 *.swp
 *~
 /_*.json
+# re-include sample data for review (override *.parquet/*.csv/*.npz)
+!samples/
+!samples/**

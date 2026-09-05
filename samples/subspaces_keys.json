@@ -1,0 +1,41 @@
+{
+ "n_keys": 735,
+ "sample_keys": [
+  "token_natural_filtered__residual_00__mean",
+  "token_natural_filtered__residual_00__eigenvalues",
+  "token_natural_filtered__residual_00__eigenvectors",
+  "token_natural_filtered__residual_01__mean",
+  "token_natural_filtered__residual_01__eigenvalues",
+  "token_natural_filtered__residual_01__eigenvectors",
+  "token_natural_filtered__residual_02__mean",
+  "token_natural_filtered__residual_02__eigenvalues"
+ ],
+ "shapes": {
+  "token_natural_filtered__residual_00__mean": [
+   768
+  ],
+  "token_natural_filtered__residual_00__eigenvalues": [
+   768
+  ],
+  "token_natural_filtered__residual_00__eigenvectors": [
+   768,
+   768
+  ],
+  "token_natural_filtered__residual_01__mean": [
+   768
+  ],
+  "token_natural_filtered__residual_01__eigenvalues": [
+   768
+  ],
+  "token_natural_filtered__residual_01__eigenvectors": [
+   768,
+   768
+  ],
+  "token_natural_filtered__residual_02__mean": [
+   768
+  ],
+  "token_natural_filtered__residual_02__eigenvalues": [
+   768
+  ]
+ }
+}
